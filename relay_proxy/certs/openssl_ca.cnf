@@ -1,0 +1,12 @@
+[ req ]
+distinguished_name = req_distinguished_name
+prompt = no
+
+[ req_distinguished_name ]
+CN = Local DLP MITM Root CA
+
+[ v3_ca ]
+basicConstraints = critical, CA:TRUE
+keyUsage = critical, keyCertSign, cRLSign
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always,issuer

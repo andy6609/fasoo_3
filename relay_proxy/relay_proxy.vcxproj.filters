@@ -1,0 +1,162 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="소스 파일">
+      <UniqueIdentifier>{4FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
+      <Extensions>cpp;c;cc;cxx;c++;cppm;ixx;def;odl;idl;hpj;bat;asm;asmx</Extensions>
+    </Filter>
+    <Filter Include="헤더 파일">
+      <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+      <Extensions>h;hh;hpp;hxx;h++;hm;inl;inc;ipp;xsd</Extensions>
+    </Filter>
+    <Filter Include="리소스 파일">
+      <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
+      <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="relay_proxy.c">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="socket_utils.c">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="http_parser.c">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="dlp_engine.c">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="http_block_response.c">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="policy_engine.c">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="logger.c">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="audit_log.c">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="request_buffer.c">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="pattern_detector.c">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="body_decoder.c">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="session_context.c">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="command_thread.c">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="response_buffer.c">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="http_response_parser.c">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="process_metadata.c">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="upstream_resolver.c">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="tls_mitm_engine.c">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="cert_manager.c">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="mitm_target_policy.c">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="tls_intercept_policy.c">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="multipart_parser.c">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="content_decoder.c">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="chunked_decoder.c">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="socket_utils.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
+    <ClInclude Include="http_parser.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
+    <ClInclude Include="dlp_engine.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
+    <ClInclude Include="http_block_response.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
+    <ClInclude Include="policy_engine.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
+    <ClInclude Include="logger.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
+    <ClInclude Include="audit_log.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
+    <ClInclude Include="request_buffer.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
+    <ClInclude Include="pattern_detector.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
+    <ClInclude Include="body_decoder.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
+    <ClInclude Include="session_context.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
+    <ClInclude Include="command_thread.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
+    <ClInclude Include="response_buffer.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
+    <ClInclude Include="http_response_parser.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
+    <ClInclude Include="process_metadata.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
+    <ClInclude Include="upstream_resolver.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
+    <ClInclude Include="tls_mitm_engine.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
+    <ClInclude Include="cert_manager.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
+    <ClInclude Include="mitm_target_policy.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
+    <ClInclude Include="tls_intercept_policy.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
+    <ClInclude Include="multipart_parser.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
+    <ClInclude Include="content_decoder.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
+    <ClInclude Include="chunked_decoder.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
+  </ItemGroup>
+</Project>

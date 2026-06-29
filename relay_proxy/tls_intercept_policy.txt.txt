@@ -1,0 +1,14 @@
+demo.local:9443 MITM
+127.0.0.1:9443 MITM
+localhost:9443 MITM
+
+chatgpt.com:443 MITM
+*.openai.com:443 MITM
+drive.google.com:443 MITM
+github.com:443 MITM
+
+accounts.google.com:443 BYPASS
+safebrowsing.google.com:443 BYPASS
+clients4.google.com:443 BYPASS
+
+DEFAULT BYPASS

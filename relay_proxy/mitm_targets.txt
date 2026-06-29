@@ -1,0 +1,21 @@
+# MITM target allowlist
+#
+# Only CONNECT targets listed here will be decrypted by TLS MITM.
+# All other HTTPS CONNECT traffic is passed through as raw encrypted tunnel.
+#
+# This prevents Chrome background traffic such as chatgpt.com, google.com,
+# safebrowsing.google.com, play.google.com, etc. from being MITM-decrypted
+# during local browser tests.
+#
+# Format:
+#   host
+#   host:port
+#   *.domain.com
+#   *.domain.com:443
+#
+# Browser local test target:
+demo.local:9443
+
+# Test client target:
+127.0.0.1:9443
+localhost:9443

@@ -1,0 +1,11 @@
+# rule_id|action|type|pattern|reason
+1|BLOCK|KEYWORD|secret|Sensitive keyword detected: secret
+2|BLOCK|KEYWORD|password|Password keyword detected
+3|LOG_ONLY|KEYWORD|confidential|Confidential keyword detected. log only
+4|BLOCK|EMAIL|-|Email address detected
+5|BLOCK|PHONE|-|Phone number detected
+6|BLOCK|RESIDENT_ID|-|Resident ID pattern detected
+7|BLOCK|CREDIT_CARD|-|Credit card pattern detected
+8|LOG_ONLY|FILE_EXT|.xlsx|Excel file upload blocked
+9|BLOCK|FILE_EXT|.zip|Zip file upload blocked
+10|LOG_ONLY|FILE_UPLOAD|-|File upload detected. log only

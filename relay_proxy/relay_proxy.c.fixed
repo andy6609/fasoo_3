@@ -1,0 +1,1800 @@
+#define _CRT_SECURE_NO_WARNINGS
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+
+#include <stdio.h>
+#include <string.h>
+#include <direct.h>
+#include <stdlib.h>
+#include <process.h>
+
+#include <WinSock2.h>
+#include <WS2tcpip.h>
+#include <Windows.h>
+
+#include "socket_utils.h"
+#include "http_parser.h"
+#include "http_response_parser.h"
+#include "dlp_engine.h"
+#include "http_block_response.h"
+#include "logger.h"
+#include "audit_log.h"
+#include "request_buffer.h"
+#include "response_buffer.h"
+#include "policy_engine.h"
+#include "session_context.h"
+#include "process_metadata.h"
+#include "command_thread.h"
+#include "upstream_resolver.h"
+#include "tls_mitm_engine.h"
+#include "tls_intercept_policy.h"
+#include "multipart_parser.h"
+#include "content_decoder.h"
+#include "chunked_decoder.h"
+
+#pragma comment(lib, "Ws2_32.lib")
+
+#define PROXY_PORT 8000
+#define POLICY_FILE_PATH "policy_rules.txt"
+#define TLS_INTERCEPT_POLICY_FILE_PATH "tls_intercept_policy.txt"
+
+#define BUFFER_SIZE 4096
+#define SELECT_TIMEOUT_SEC 300
+#define ENABLE_TLS_MITM 1
+
+static int is_same_endpoint(
+    const char* ip1,
+    int port1,
+    const char* ip2,
+    int port2
+)
+{
+    if (ip1 == NULL || ip2 == NULL) {
+        return 0;
+    }
+
+    return (_stricmp(ip1, ip2) == 0 && port1 == port2);
+}
+
+static int ensure_upstream_connected(
+    proxy_session_context_t* session,
+    SOCKET* upstream_sock,
+    const http_request_t* request
+)
+{
+    upstream_target_t target;
+
+    if (session == NULL || upstream_sock == NULL || request == NULL) {
+        return -1;
+    }
+
+    if (*upstream_sock != INVALID_SOCKET) {
+        return 0;
+    }
+
+    upstream_target_init(&target);
+
+    if (upstream_resolve_from_host_header(request->host, &target) != 0) {
+        log_error(
+            "failed to resolve upstream from Host header. session_id=%lu host=%s",
+            session->session_id,
+            request->host[0] != '\0' ? request->host : "-"
+        );
+        return -1;
+    }
+
+    upstream_target_log(session->session_id, &target);
+
+    if (is_same_endpoint(target.ip, target.port, session->proxy_ip, session->proxy_port)) {
+        log_error(
+            "resolved upstream points to proxy itself. session_id=%lu upstream=%s:%d",
+            session->session_id,
+            target.ip,
+            target.port
+        );
+        return -1;
+    }
+
+    *upstream_sock = connect_upstream(target.ip, target.port);
+    if (*upstream_sock == INVALID_SOCKET) {
+        log_error(
+            "connect_upstream() failed. session_id=%lu host=%s ip=%s port=%d",
+            session->session_id,
+            target.host,
+            target.ip,
+            target.port
+        );
+        return -1;
+    }
+
+    session_context_set_upstream(session, target.ip, target.port);
+
+    log_info(
+        "connected to upstream server. session_id=%lu host=%s upstream=%s:%d",
+        session->session_id,
+        target.host,
+        target.ip,
+        target.port
+    );
+
+    return 0;
+}
+
+
+static int is_connect_request(const http_request_t* request)
+{
+    if (request == NULL) {
+        return 0;
+    }
+
+    return _stricmp(request->method, "CONNECT") == 0;
+}
+
+static int should_suppress_connect_policy_logs(
+    proxy_session_context_t* session,
+    const http_request_t* request
+)
+{
+#if ENABLE_TLS_MITM
+    upstream_target_t target;
+    tls_intercept_decision_t decision;
+    const char* connect_target;
+
+    if (session == NULL || request == NULL || !is_connect_request(request)) {
+        return 0;
+    }
+
+    connect_target = request->path[0] != '\0' ? request->path : request->host;
+    if (connect_target == NULL || connect_target[0] == '\0') {
+        return 0;
+    }
+
+    upstream_target_init(&target);
+    if (upstream_resolve_from_connect_target(connect_target, &target) != 0) {
+        return 0;
+    }
+
+    memset(&decision, 0, sizeof(decision));
+    tls_intercept_policy_decide_with_process_silent(
+        target.host,
+        target.port,
+        session->process.process_name,
+        &decision
+    );
+
+    return decision.action == TLS_INTERCEPT_ACTION_IGNORE;
+#else
+    (void)session;
+    (void)request;
+    return 0;
+#endif
+}
+
+static int send_connect_established_response(SOCKET client_sock)
+{
+    const char* response =
+        "HTTP/1.1 200 Connection Established\r\n"
+        "Proxy-Agent: local-dlp-proxy\r\n"
+        "Connection: keep-alive\r\n"
+        "\r\n";
+
+    int response_length = (int)strlen(response);
+
+    if (send_all(client_sock, response, response_length) == SOCKET_ERROR) {
+        return SOCKET_ERROR;
+    }
+
+    return response_length;
+}
+
+#define RAW_TUNNEL_CHUNK_DEBUG 0
+#define RAW_TUNNEL_IDLE_TIMEOUT_SEC 30
+
+static const char* safe_log_string(const char* value)
+{
+    if (value == NULL || value[0] == '\0') {
+        return "-";
+    }
+
+    return value;
+}
+
+static void log_raw_tunnel_summary(
+    const proxy_session_context_t* session,
+    const char* target_host,
+    int target_port,
+    const char* policy_action,
+    const char* policy_reason,
+    unsigned long long bytes_client_to_upstream,
+    unsigned long long bytes_upstream_to_client,
+    unsigned long long chunk_count_client_to_upstream,
+    unsigned long long chunk_count_upstream_to_client,
+    unsigned long long duration_ms,
+    const char* finish_reason,
+    int result
+)
+{
+    if (session == NULL) {
+        return;
+    }
+
+    log_info(
+        "CONNECT raw tunnel summary. session_id=%lu process=%s target=%s:%d policy_action=%s result=%s finish_reason=%s duration_ms=%llu client_to_upstream_bytes=%llu upstream_to_client_bytes=%llu client_to_upstream_chunks=%llu upstream_to_client_chunks=%llu",
+        session->session_id,
+        session->process.process_name[0] != '\0' ? session->process.process_name : "-",
+        safe_log_string(target_host),
+        target_port,
+        safe_log_string(policy_action),
+        result == 0 ? "OK" : "ERROR",
+        safe_log_string(finish_reason),
+        duration_ms,
+        bytes_client_to_upstream,
+        bytes_upstream_to_client,
+        chunk_count_client_to_upstream,
+        chunk_count_upstream_to_client
+    );
+
+    log_security(
+        "AUDIT session_id=%lu direction=CONNECT action=RAW_TUNNEL_SUMMARY process_id=%lu process_name=%s process_path=\"%s\" target=%s:%d upstream=%s:%d policy_action=%s reason=\"%s\" result=%s finish_reason=%s duration_ms=%llu bytes_client_to_upstream=%llu bytes_upstream_to_client=%llu chunks_client_to_upstream=%llu chunks_upstream_to_client=%llu",
+        session->session_id,
+        (unsigned long)session->process.process_id,
+        session->process.process_name[0] != '\0' ? session->process.process_name : "-",
+        session->process.process_path[0] != '\0' ? session->process.process_path : "-",
+        safe_log_string(target_host),
+        target_port,
+        session->upstream_ip[0] != '\0' ? session->upstream_ip : "-",
+        session->upstream_port,
+        safe_log_string(policy_action),
+        safe_log_string(policy_reason),
+        result == 0 ? "OK" : "ERROR",
+        safe_log_string(finish_reason),
+        duration_ms,
+        bytes_client_to_upstream,
+        bytes_upstream_to_client,
+        chunk_count_client_to_upstream,
+        chunk_count_upstream_to_client
+    );
+}
+
+static int raw_tunnel_loop(
+    proxy_session_context_t* session,
+    SOCKET upstream_sock,
+    const char* target_host,
+    int target_port,
+    const char* policy_action,
+    const char* policy_reason,
+    int suppress_tunnel_logs
+)
+{
+    SOCKET client_sock;
+    char tunnel_buffer[BUFFER_SIZE];
+    unsigned long long bytes_client_to_upstream = 0;
+    unsigned long long bytes_upstream_to_client = 0;
+    unsigned long long chunk_count_client_to_upstream = 0;
+    unsigned long long chunk_count_upstream_to_client = 0;
+    ULONGLONG started_ms;
+    ULONGLONG finished_ms;
+    const char* finish_reason = "unknown";
+    int result = 0;
+
+    if (session == NULL || upstream_sock == INVALID_SOCKET) {
+        return -1;
+    }
+
+    client_sock = session->client_sock;
+    started_ms = GetTickCount64();
+
+    if (!suppress_tunnel_logs) {
+        log_info(
+            "CONNECT raw tunnel loop started. session_id=%lu process=%s target=%s:%d policy_action=%s client=%s:%d upstream=%s:%d",
+            session->session_id,
+            session->process.process_name[0] != '\0' ? session->process.process_name : "-",
+            safe_log_string(target_host),
+            target_port,
+            safe_log_string(policy_action),
+            session->client_ip,
+            session->client_port,
+            session->upstream_ip,
+            session->upstream_port
+        );
+    }
+
+    while (1) {
+        fd_set read_fds;
+        int select_result;
+        struct timeval timeout;
+
+        FD_ZERO(&read_fds);
+        FD_SET(client_sock, &read_fds);
+        FD_SET(upstream_sock, &read_fds);
+
+        timeout.tv_sec = RAW_TUNNEL_IDLE_TIMEOUT_SEC;
+        timeout.tv_usec = 0;
+
+        select_result = select(0, &read_fds, NULL, NULL, &timeout);
+
+        if (select_result == SOCKET_ERROR) {
+            log_error(
+                "CONNECT tunnel select() failed. session_id=%lu error=%d",
+                session->session_id,
+                WSAGetLastError()
+            );
+            finish_reason = "select_error";
+            result = -1;
+            break;
+        }
+
+        if (select_result == 0) {
+            if (!suppress_tunnel_logs) {
+                log_info(
+                    "CONNECT tunnel idle timeout. session_id=%lu no data for %d seconds. raw tunnel will be summarized and closed",
+                    session->session_id,
+                    RAW_TUNNEL_IDLE_TIMEOUT_SEC
+                );
+            }
+            finish_reason = "idle_timeout";
+            result = 0;
+            break;
+        }
+
+        if (FD_ISSET(client_sock, &read_fds)) {
+            int recv_len = recv(client_sock, tunnel_buffer, BUFFER_SIZE, 0);
+
+            if (recv_len > 0) {
+                session_context_add_bytes_from_client(session, recv_len);
+
+                if (send_all(upstream_sock, tunnel_buffer, recv_len) == SOCKET_ERROR) {
+                    log_error(
+                        "CONNECT tunnel send_all() to upstream failed. session_id=%lu error=%d",
+                        session->session_id,
+                        WSAGetLastError()
+                    );
+                    finish_reason = "send_to_upstream_error";
+                    result = -1;
+                    break;
+                }
+
+                session_context_add_bytes_to_upstream(session, recv_len);
+                bytes_client_to_upstream += (unsigned long long)recv_len;
+                chunk_count_client_to_upstream++;
+
+#if RAW_TUNNEL_CHUNK_DEBUG
+                log_debug(
+                    "CONNECT TUNNEL CLIENT -> UPSTREAM: session_id=%lu %d bytes relayed",
+                    session->session_id,
+                    recv_len
+                );
+#endif
+            }
+            else if (recv_len == 0) {
+                if (!suppress_tunnel_logs) {
+                    log_info(
+                        "CONNECT tunnel client disconnected. session_id=%lu",
+                        session->session_id
+                    );
+                }
+                finish_reason = "client_disconnected";
+                result = 0;
+                break;
+            }
+            else {
+                log_error(
+                    "CONNECT tunnel recv() from client failed. session_id=%lu error=%d",
+                    session->session_id,
+                    WSAGetLastError()
+                );
+                finish_reason = "recv_from_client_error";
+                result = -1;
+                break;
+            }
+        }
+
+        if (FD_ISSET(upstream_sock, &read_fds)) {
+            int recv_len = recv(upstream_sock, tunnel_buffer, BUFFER_SIZE, 0);
+
+            if (recv_len > 0) {
+                session_context_add_bytes_from_upstream(session, recv_len);
+
+                if (send_all(client_sock, tunnel_buffer, recv_len) == SOCKET_ERROR) {
+                    log_error(
+                        "CONNECT tunnel send_all() to client failed. session_id=%lu error=%d",
+                        session->session_id,
+                        WSAGetLastError()
+                    );
+                    finish_reason = "send_to_client_error";
+                    result = -1;
+                    break;
+                }
+
+                session_context_add_bytes_to_client(session, recv_len);
+                bytes_upstream_to_client += (unsigned long long)recv_len;
+                chunk_count_upstream_to_client++;
+
+#if RAW_TUNNEL_CHUNK_DEBUG
+                log_debug(
+                    "CONNECT TUNNEL UPSTREAM -> CLIENT: session_id=%lu %d bytes relayed",
+                    session->session_id,
+                    recv_len
+                );
+#endif
+            }
+            else if (recv_len == 0) {
+                if (!suppress_tunnel_logs) {
+                    log_info(
+                        "CONNECT tunnel upstream disconnected. session_id=%lu",
+                        session->session_id
+                    );
+                }
+                finish_reason = "upstream_disconnected";
+                result = 0;
+                break;
+            }
+            else {
+                log_error(
+                    "CONNECT tunnel recv() from upstream failed. session_id=%lu error=%d",
+                    session->session_id,
+                    WSAGetLastError()
+                );
+                finish_reason = "recv_from_upstream_error";
+                result = -1;
+                break;
+            }
+        }
+    }
+
+    finished_ms = GetTickCount64();
+
+    if (!suppress_tunnel_logs) {
+        log_raw_tunnel_summary(
+            session,
+            target_host,
+            target_port,
+            policy_action,
+            policy_reason,
+            bytes_client_to_upstream,
+            bytes_upstream_to_client,
+            chunk_count_client_to_upstream,
+            chunk_count_upstream_to_client,
+            (unsigned long long)(finished_ms - started_ms),
+            finish_reason,
+            result
+        );
+    }
+
+    return result;
+}
+
+
+static int forward_buffered_connect_tunnel_data(
+    proxy_session_context_t* session,
+    SOCKET upstream_sock,
+    request_buffer_t* request_buffer
+)
+{
+    int remaining_length;
+    const char* remaining_data;
+
+    if (session == NULL || upstream_sock == INVALID_SOCKET || request_buffer == NULL) {
+        return -1;
+    }
+
+    remaining_length = request_buffer_length(request_buffer);
+    if (remaining_length <= 0) {
+        return 0;
+    }
+
+    remaining_data = request_buffer_data(request_buffer);
+    if (remaining_data == NULL) {
+        return -1;
+    }
+
+    log_debug(
+        "forwarding buffered CONNECT tunnel data. session_id=%lu length=%d bytes",
+        session->session_id,
+        remaining_length
+    );
+
+    if (send_all(upstream_sock, remaining_data, remaining_length) == SOCKET_ERROR) {
+        log_error(
+            "send_all() buffered CONNECT tunnel data failed. session_id=%lu error=%d",
+            session->session_id,
+            WSAGetLastError()
+        );
+        return -1;
+    }
+
+    session_context_add_bytes_to_upstream(session, remaining_length);
+    request_buffer_consume(request_buffer, remaining_length);
+
+    return 0;
+}
+
+static int handle_connect_request(
+    proxy_session_context_t* session,
+    SOCKET* upstream_sock,
+    const http_request_t* request,
+    request_buffer_t* request_buffer,
+    int complete_request_length
+)
+{
+    upstream_target_t target;
+    const char* connect_target;
+    int response_sent;
+    int remaining_length;
+#if ENABLE_TLS_MITM
+    tls_intercept_decision_t tls_policy_decision;
+    int suppress_policy_logs = 0;
+#endif
+
+    if (session == NULL ||
+        upstream_sock == NULL ||
+        request == NULL ||
+        request_buffer == NULL) {
+        return -1;
+    }
+
+    if (*upstream_sock != INVALID_SOCKET) {
+        log_error(
+            "CONNECT request received after upstream was already connected. session_id=%lu",
+            session->session_id
+        );
+        return -1;
+    }
+
+    connect_target = request->path[0] != '\0' ? request->path : request->host;
+
+    upstream_target_init(&target);
+
+    if (upstream_resolve_from_connect_target(connect_target, &target) != 0) {
+        int error_response_sent;
+
+        log_error(
+            "failed to resolve CONNECT target. session_id=%lu target=%s",
+            session->session_id,
+            connect_target != NULL ? connect_target : "-"
+        );
+
+        error_response_sent = send_block_response(
+            session->client_sock,
+            "Proxy failed to resolve CONNECT target."
+        );
+
+        if (error_response_sent != SOCKET_ERROR) {
+            session_context_add_bytes_to_client(session, error_response_sent);
+        }
+
+        return -1;
+    }
+
+    if (is_same_endpoint(target.ip, target.port, session->proxy_ip, session->proxy_port)) {
+        int error_response_sent;
+
+        log_error(
+            "CONNECT target points to proxy itself. session_id=%lu upstream=%s:%d",
+            session->session_id,
+            target.ip,
+            target.port
+        );
+
+        error_response_sent = send_block_response(
+            session->client_sock,
+            "CONNECT target points to proxy itself."
+        );
+
+        if (error_response_sent != SOCKET_ERROR) {
+            session_context_add_bytes_to_client(session, error_response_sent);
+        }
+
+        return -1;
+    }
+
+#if ENABLE_TLS_MITM
+    memset(&tls_policy_decision, 0, sizeof(tls_policy_decision));
+    tls_intercept_policy_decide_with_process(
+        target.host,
+        target.port,
+        session->process.process_name,
+        &tls_policy_decision
+    );
+
+    suppress_policy_logs = (tls_policy_decision.action == TLS_INTERCEPT_ACTION_IGNORE);
+
+    if (!suppress_policy_logs) {
+        log_info(
+            "CONNECT request detected. session_id=%lu target=%s",
+            session->session_id,
+            connect_target != NULL && connect_target[0] != '\0' ? connect_target : "-"
+        );
+
+        log_info(
+            "CONNECT TLS policy decision. session_id=%lu process=%s target=%s:%d action=%s matched=%s rule_process=%s reason=\"%s\"",
+            session->session_id,
+            session->process.process_name[0] != '\0' ? session->process.process_name : "-",
+            target.host,
+            target.port,
+            tls_intercept_policy_action_to_string(tls_policy_decision.action),
+            tls_policy_decision.matched ? "rule" : "default",
+            tls_policy_decision.rule_process[0] != '\0' ? tls_policy_decision.rule_process : "-",
+            tls_policy_decision.reason[0] != '\0' ? tls_policy_decision.reason : "-"
+        );
+    }
+
+    if (tls_policy_decision.action == TLS_INTERCEPT_ACTION_BLOCK) {
+        int block_response_sent;
+
+        log_security(
+            "CONNECT blocked by TLS intercept policy. session_id=%lu process_id=%lu process_name=%s target=%s:%d reason=\"%s\"",
+            session->session_id,
+            (unsigned long)session->process.process_id,
+            session->process.process_name[0] != '\0' ? session->process.process_name : "-",
+            target.host,
+            target.port,
+            tls_policy_decision.reason[0] != '\0' ? tls_policy_decision.reason : "TLS intercept policy BLOCK"
+        );
+
+        block_response_sent = send_block_response(
+            session->client_sock,
+            tls_policy_decision.reason[0] != '\0' ? tls_policy_decision.reason : "CONNECT blocked by TLS intercept policy."
+        );
+
+        if (block_response_sent == SOCKET_ERROR) {
+            log_error(
+                "send_block_response() for CONNECT policy block failed. session_id=%lu error=%d",
+                session->session_id,
+                WSAGetLastError()
+            );
+            return -1;
+        }
+
+        session_context_add_bytes_to_client(session, block_response_sent);
+        request_buffer_consume(request_buffer, complete_request_length);
+        return 0;
+    }
+#endif
+
+#if ENABLE_TLS_MITM
+    if (!suppress_policy_logs) {
+        upstream_target_log_connect(session->session_id, &target);
+    }
+#else
+    upstream_target_log_connect(session->session_id, &target);
+#endif
+
+    *upstream_sock = connect_upstream(target.ip, target.port);
+    if (*upstream_sock == INVALID_SOCKET) {
+        int error_response_sent;
+
+        log_error(
+            "connect_upstream() failed for CONNECT. session_id=%lu host=%s ip=%s port=%d",
+            session->session_id,
+            target.host,
+            target.ip,
+            target.port
+        );
+
+        error_response_sent = send_block_response(
+            session->client_sock,
+            "Proxy failed to connect to CONNECT upstream server."
+        );
+
+        if (error_response_sent != SOCKET_ERROR) {
+            session_context_add_bytes_to_client(session, error_response_sent);
+        }
+
+        return -1;
+    }
+
+    session_context_set_upstream(session, target.ip, target.port);
+
+#if ENABLE_TLS_MITM
+    if (!suppress_policy_logs) {
+        log_info(
+            "connected to CONNECT upstream. session_id=%lu host=%s upstream=%s:%d",
+            session->session_id,
+            target.host,
+            target.ip,
+            target.port
+        );
+    }
+#else
+    log_info(
+        "connected to CONNECT upstream. session_id=%lu host=%s upstream=%s:%d",
+        session->session_id,
+        target.host,
+        target.ip,
+        target.port
+    );
+#endif
+
+    response_sent = send_connect_established_response(session->client_sock);
+    if (response_sent == SOCKET_ERROR) {
+        log_error(
+            "send CONNECT 200 response failed. session_id=%lu error=%d",
+            session->session_id,
+            WSAGetLastError()
+        );
+        return -1;
+    }
+
+    session_context_add_bytes_to_client(session, response_sent);
+
+#if ENABLE_TLS_MITM
+    if (!suppress_policy_logs) {
+        log_info(
+            "CONNECT tunnel established. session_id=%lu target=%s upstream=%s:%d",
+            session->session_id,
+            target.host,
+            target.ip,
+            target.port
+        );
+        audit_log_connect_tunnel_event(session, request);
+    }
+#else
+    log_info(
+        "CONNECT tunnel established. session_id=%lu target=%s upstream=%s:%d",
+        session->session_id,
+        target.host,
+        target.ip,
+        target.port
+    );
+    audit_log_connect_tunnel_event(session, request);
+#endif
+
+    request_buffer_consume(request_buffer, complete_request_length);
+
+    remaining_length = request_buffer_length(request_buffer);
+
+#if ENABLE_TLS_MITM
+    if (tls_policy_decision.action == TLS_INTERCEPT_ACTION_BYPASS ||
+        tls_policy_decision.action == TLS_INTERCEPT_ACTION_AUDIT ||
+        tls_policy_decision.action == TLS_INTERCEPT_ACTION_IGNORE) {
+        if (!suppress_policy_logs) {
+            log_info(
+                "CONNECT TLS MITM bypassed by policy. session_id=%lu target=%s:%d action=%s mode=raw_tunnel reason=\"%s\"",
+                session->session_id,
+                target.host,
+                target.port,
+                tls_intercept_policy_action_to_string(tls_policy_decision.action),
+                tls_policy_decision.reason[0] != '\0' ? tls_policy_decision.reason : "-"
+            );
+        }
+
+        if (tls_policy_decision.action == TLS_INTERCEPT_ACTION_AUDIT) {
+            log_security(
+                "CONNECT audit-only policy decision. session_id=%lu process_id=%lu process_name=%s target=%s:%d encrypted_bytes_will_be_relayed=true reason=\"%s\"",
+                session->session_id,
+                (unsigned long)session->process.process_id,
+                session->process.process_name[0] != '\0' ? session->process.process_name : "-",
+                target.host,
+                target.port,
+                tls_policy_decision.reason[0] != '\0' ? tls_policy_decision.reason : "AUDIT"
+            );
+        }
+
+        if (forward_buffered_connect_tunnel_data(session, *upstream_sock, request_buffer) != 0) {
+            return -1;
+        }
+
+        return raw_tunnel_loop(
+            session,
+            *upstream_sock,
+            target.host,
+            target.port,
+            tls_intercept_policy_action_to_string(tls_policy_decision.action),
+            tls_policy_decision.reason[0] != '\0' ? tls_policy_decision.reason : "-",
+            suppress_policy_logs
+        );
+    }
+
+    if (remaining_length > 0) {
+        log_warn(
+            "CONNECT buffered data exists after CONNECT header. session_id=%lu length=%d. TLS MITM mode does not support pre-read TLS bytes yet.",
+            session->session_id,
+            remaining_length
+        );
+        return -1;
+    }
+
+    log_info(
+        "CONNECT TLS MITM mode selected by policy. session_id=%lu target=%s:%d upstream=%s:%d reason=\"%s\"",
+        session->session_id,
+        target.host,
+        target.port,
+        session->upstream_ip,
+        session->upstream_port,
+        tls_policy_decision.reason[0] != '\0' ? tls_policy_decision.reason : "-"
+    );
+
+    return tls_mitm_handle_connect_session(session, *upstream_sock, request);
+#else
+    if (forward_buffered_connect_tunnel_data(session, *upstream_sock, request_buffer) != 0) {
+        return -1;
+    }
+
+    return raw_tunnel_loop(
+        session,
+        *upstream_sock,
+        target.host,
+        target.port,
+        "RAW",
+        "TLS_MITM_DISABLED",
+        0
+    );
+#endif
+}
+
+int relay_loop(proxy_session_context_t* session)
+{
+    SOCKET client_sock;
+    SOCKET upstream_sock = INVALID_SOCKET;
+
+    char recv_buffer[BUFFER_SIZE];
+    request_buffer_t request_buffer;
+    response_buffer_t response_buffer;
+
+    int loop_result = 0;
+
+    if (session == NULL) {
+        log_error("relay_loop() received NULL session");
+        return -1;
+    }
+
+    client_sock = session->client_sock;
+
+    request_buffer_init(&request_buffer);
+    response_buffer_init(&response_buffer);
+
+    while (1) {
+        fd_set read_fds;
+        int select_result;
+        struct timeval timeout;
+
+        FD_ZERO(&read_fds);
+        FD_SET(client_sock, &read_fds);
+
+        if (upstream_sock != INVALID_SOCKET) {
+            FD_SET(upstream_sock, &read_fds);
+        }
+
+        timeout.tv_sec = SELECT_TIMEOUT_SEC;
+        timeout.tv_usec = 0;
+
+        select_result = select(0, &read_fds, NULL, NULL, &timeout);
+
+        if (select_result == SOCKET_ERROR) {
+            log_error(
+                "select() failed. session_id=%lu error=%d",
+                session->session_id,
+                WSAGetLastError()
+            );
+            loop_result = -1;
+            break;
+        }
+
+        if (select_result == 0) {
+            log_info(
+                "relay timeout. session_id=%lu no data for %d seconds",
+                session->session_id,
+                SELECT_TIMEOUT_SEC
+            );
+            loop_result = 0;
+            break;
+        }
+
+        /*
+            Client -> Proxy -> Dynamic Upstream
+        */
+        if (FD_ISSET(client_sock, &read_fds)) {
+            int recv_len = recv(client_sock, recv_buffer, BUFFER_SIZE, 0);
+
+            if (recv_len > 0) {
+                int append_result;
+
+                session_context_add_bytes_from_client(session, recv_len);
+
+                log_debug(
+                    "CLIENT -> PROXY: session_id=%lu %d bytes received",
+                    session->session_id,
+                    recv_len
+                );
+
+                append_result = request_buffer_append(
+                    &request_buffer,
+                    recv_buffer,
+                    recv_len
+                );
+
+                if (append_result != 0) {
+                    log_error(
+                        "request_buffer_append() failed. session_id=%lu buffer may be full.",
+                        session->session_id
+                    );
+                    loop_result = -1;
+                    break;
+                }
+
+                log_debug(
+                    "request buffer size: session_id=%lu %d bytes",
+                    session->session_id,
+                    request_buffer_length(&request_buffer)
+                );
+
+                while (1) {
+                    int complete_request_length = 0;
+                    int complete_result;
+
+                    complete_result = request_buffer_get_complete_request_length(
+                        &request_buffer,
+                        &complete_request_length
+                    );
+
+                    if (complete_result < 0) {
+                        log_error(
+                            "request_buffer_get_complete_request_length() failed. session_id=%lu",
+                            session->session_id
+                        );
+                        loop_result = -1;
+                        goto cleanup;
+                    }
+
+                    if (complete_result == 0) {
+                        log_debug(
+                            "HTTP request is incomplete. session_id=%lu waiting for more data.",
+                            session->session_id
+                        );
+                        break;
+                    }
+
+                    if (complete_request_length <= 0) {
+                        log_error(
+                            "invalid complete_request_length. session_id=%lu length=%d",
+                            session->session_id,
+                            complete_request_length
+                        );
+                        loop_result = -1;
+                        goto cleanup;
+                    }
+
+                    log_debug(
+                        "complete HTTP request detected. session_id=%lu length=%d bytes",
+                        session->session_id,
+                        complete_request_length
+                    );
+
+                    {
+                        const char* request_data;
+                        http_request_t request;
+                        dlp_result_t dlp_result;
+                        int parsed_ok;
+
+                        request_data = request_buffer_data(&request_buffer);
+
+                        memset(&request, 0, sizeof(request));
+                        memset(&dlp_result, 0, sizeof(dlp_result));
+                        dlp_result.action = DLP_ACTION_ALLOW;
+
+                        parsed_ok = parse_http_request(
+                            request_data,
+                            complete_request_length,
+                            &request
+                        );
+
+                        if (!parsed_ok) {
+                            log_error(
+                                "Received data could not be parsed as HTTP request. session_id=%lu",
+                                session->session_id
+                            );
+                            loop_result = -1;
+                            goto cleanup;
+                        }
+
+                        if (!should_suppress_connect_policy_logs(session, &request)) {
+                            print_http_request(&request);
+                        }
+
+                        if (is_connect_request(&request)) {
+                            loop_result = handle_connect_request(
+                                session,
+                                &upstream_sock,
+                                &request,
+                                &request_buffer,
+                                complete_request_length
+                            );
+
+                            goto cleanup;
+                        }
+
+                        {
+                            http_request_t decoded_request_for_dlp;
+                            const http_request_t* request_for_dlp;
+                            int chunked_decode_result;
+
+                            memset(&decoded_request_for_dlp, 0, sizeof(decoded_request_for_dlp));
+                            request_for_dlp = &request;
+
+                            chunked_decode_result = chunked_decoder_prepare_request_for_dlp(
+                                &request,
+                                request_data,
+                                complete_request_length,
+                                &decoded_request_for_dlp,
+                                "PLAIN HTTP REQUEST"
+                            );
+
+                            if (chunked_decode_result == 1) {
+                                request_for_dlp = &decoded_request_for_dlp;
+                                log_debug(
+                                    "HTTP request DLP will inspect dechunked body. session_id=%lu",
+                                    session->session_id
+                                );
+                            }
+                            else if (chunked_decode_result < 0) {
+                                log_warn(
+                                    "HTTP request chunk decoding failed. session_id=%lu DLP will inspect original request body.",
+                                    session->session_id
+                                );
+                            }
+
+                        dlp_result = inspect_dlp_request(request_for_dlp);
+                        inspect_multipart_upload_request(request_for_dlp, &dlp_result);
+
+                        if (dlp_result.action == DLP_ACTION_BLOCK) {
+                            int block_response_sent;
+
+                            log_security(
+                                "Request blocked. session_id=%lu Not forwarding to upstream.",
+                                session->session_id
+                            );
+                            log_security(
+                                "Matched rule id: session_id=%lu rule_id=%d",
+                                session->session_id,
+                                dlp_result.matched_rule_id
+                            );
+                            log_security(
+                                "Matched keyword: session_id=%lu keyword=%s",
+                                session->session_id,
+                                dlp_result.keyword
+                            );
+                            log_security(
+                                "Block reason: session_id=%lu reason=%s",
+                                session->session_id,
+                                dlp_result.reason
+                            );
+
+                            audit_log_block_event(session, request_for_dlp, &dlp_result);
+
+                            block_response_sent = send_block_response(
+                                client_sock,
+                                dlp_result.reason
+                            );
+
+                            if (block_response_sent == SOCKET_ERROR) {
+                                log_error(
+                                    "send_block_response() failed. session_id=%lu error=%d",
+                                    session->session_id,
+                                    WSAGetLastError()
+                                );
+                                loop_result = -1;
+                                goto cleanup;
+                            }
+
+                            session_context_add_bytes_to_client(
+                                session,
+                                block_response_sent
+                            );
+
+                            loop_result = 0;
+                            goto cleanup;
+                        }
+                        else if (dlp_result.action == DLP_ACTION_LOG_ONLY) {
+                            log_security(
+                                "DLP log-only rule matched. session_id=%lu",
+                                session->session_id
+                            );
+                            log_security(
+                                "Matched rule id: session_id=%lu rule_id=%d",
+                                session->session_id,
+                                dlp_result.matched_rule_id
+                            );
+                            log_security(
+                                "Matched keyword: session_id=%lu keyword=%s",
+                                session->session_id,
+                                dlp_result.keyword
+                            );
+                            log_security(
+                                "Reason: session_id=%lu reason=%s",
+                                session->session_id,
+                                dlp_result.reason
+                            );
+
+                            audit_log_log_only_event(session, request_for_dlp, &dlp_result);
+                        }
+
+                        if (ensure_upstream_connected(
+                            session,
+                            &upstream_sock,
+                            &request
+                        ) != 0) {
+                            int error_response_sent;
+
+                            error_response_sent = send_block_response(
+                                client_sock,
+                                "Proxy failed to resolve or connect to upstream server."
+                            );
+
+                            if (error_response_sent != SOCKET_ERROR) {
+                                session_context_add_bytes_to_client(
+                                    session,
+                                    error_response_sent
+                                );
+                            }
+
+                            loop_result = -1;
+                            goto cleanup;
+                        }
+
+                        if (send_all(upstream_sock, request_data, complete_request_length) == SOCKET_ERROR) {
+                            log_error(
+                                "send_all() to upstream failed. session_id=%lu error=%d",
+                                session->session_id,
+                                WSAGetLastError()
+                            );
+                            loop_result = -1;
+                            goto cleanup;
+                        }
+
+                        session_context_add_bytes_to_upstream(
+                            session,
+                            complete_request_length
+                        );
+
+                        log_debug(
+                            "PROXY -> UPSTREAM: session_id=%lu %d bytes forwarded",
+                            session->session_id,
+                            complete_request_length
+                        );
+
+                        request_buffer_consume(
+                            &request_buffer,
+                            complete_request_length
+                        );
+                    }
+                }
+            }
+            }
+            else if (recv_len == 0) {
+                log_info(
+                    "client disconnected. session_id=%lu",
+                    session->session_id
+                );
+                loop_result = 0;
+                break;
+            }
+            else {
+                log_error(
+                    "recv() from client failed. session_id=%lu error=%d",
+                    session->session_id,
+                    WSAGetLastError()
+                );
+                loop_result = -1;
+                break;
+            }
+        }
+
+        /*
+            Dynamic Upstream -> Proxy -> Client
+        */
+        if (upstream_sock != INVALID_SOCKET && FD_ISSET(upstream_sock, &read_fds)) {
+            int recv_len = recv(upstream_sock, recv_buffer, BUFFER_SIZE, 0);
+
+            if (recv_len > 0) {
+                int append_result;
+
+                session_context_add_bytes_from_upstream(session, recv_len);
+
+                log_debug(
+                    "UPSTREAM -> PROXY: session_id=%lu %d bytes received",
+                    session->session_id,
+                    recv_len
+                );
+
+                append_result = response_buffer_append(
+                    &response_buffer,
+                    recv_buffer,
+                    recv_len
+                );
+
+                if (append_result != 0) {
+                    log_error(
+                        "response_buffer_append() failed. session_id=%lu buffer may be full.",
+                        session->session_id
+                    );
+                    loop_result = -1;
+                    break;
+                }
+
+                log_debug(
+                    "response buffer size: session_id=%lu %d bytes",
+                    session->session_id,
+                    response_buffer_length(&response_buffer)
+                );
+
+                while (1) {
+                    int complete_response_length = 0;
+                    int complete_result;
+
+                    complete_result = response_buffer_get_complete_response_length(
+                        &response_buffer,
+                        &complete_response_length
+                    );
+
+                    if (complete_result < 0) {
+                        log_error(
+                            "response_buffer_get_complete_response_length() failed. session_id=%lu",
+                            session->session_id
+                        );
+                        loop_result = -1;
+                        goto cleanup;
+                    }
+
+                    if (complete_result == 0) {
+                        log_debug(
+                            "HTTP response is incomplete. session_id=%lu waiting for more data.",
+                            session->session_id
+                        );
+                        break;
+                    }
+
+                    if (complete_response_length <= 0) {
+                        log_error(
+                            "invalid complete_response_length. session_id=%lu length=%d",
+                            session->session_id,
+                            complete_response_length
+                        );
+                        loop_result = -1;
+                        goto cleanup;
+                    }
+
+                    log_debug(
+                        "complete HTTP response detected. session_id=%lu length=%d bytes",
+                        session->session_id,
+                        complete_response_length
+                    );
+
+                    {
+                        const char* response_data;
+                        http_response_t response;
+                        dlp_result_t dlp_result;
+
+                        response_data = response_buffer_data(&response_buffer);
+
+                        memset(&response, 0, sizeof(response));
+                        memset(&dlp_result, 0, sizeof(dlp_result));
+                        dlp_result.action = DLP_ACTION_ALLOW;
+
+                        if (parse_http_response(response_data, complete_response_length, &response)) {
+                            http_response_t decoded_response_for_dlp;
+                            const http_response_t* response_for_dlp;
+                            int decode_result;
+
+                            print_http_response(&response);
+
+                            memset(&decoded_response_for_dlp, 0, sizeof(decoded_response_for_dlp));
+                            response_for_dlp = &response;
+
+                            decode_result = content_decoder_prepare_response_for_dlp(
+                                &response,
+                                response_data,
+                                complete_response_length,
+                                &decoded_response_for_dlp,
+                                "PLAIN HTTP RESPONSE"
+                            );
+
+                            if (decode_result == 1) {
+                                response_for_dlp = &decoded_response_for_dlp;
+                                log_debug(
+                                    "HTTP response DLP will inspect decompressed body. session_id=%lu",
+                                    session->session_id
+                                );
+                            }
+                            else if (decode_result < 0) {
+                                log_warn(
+                                    "HTTP response decompression failed. session_id=%lu DLP will inspect original response body.",
+                                    session->session_id
+                                );
+                            }
+
+                            dlp_result = inspect_dlp_response(response_for_dlp);
+
+                            if (dlp_result.action == DLP_ACTION_BLOCK) {
+                                int block_response_sent;
+
+                                log_security(
+                                    "Response blocked. session_id=%lu Not forwarding to client.",
+                                    session->session_id
+                                );
+                                log_security(
+                                    "Matched rule id: session_id=%lu rule_id=%d",
+                                    session->session_id,
+                                    dlp_result.matched_rule_id
+                                );
+                                log_security(
+                                    "Matched keyword: session_id=%lu keyword=%s",
+                                    session->session_id,
+                                    dlp_result.keyword
+                                );
+                                log_security(
+                                    "Block reason: session_id=%lu reason=%s",
+                                    session->session_id,
+                                    dlp_result.reason
+                                );
+
+                                audit_log_response_block_event(session, response_for_dlp, &dlp_result);
+
+                                block_response_sent = send_response_block_response(
+                                    client_sock,
+                                    dlp_result.reason
+                                );
+
+                                if (block_response_sent == SOCKET_ERROR) {
+                                    log_error(
+                                        "send_response_block_response() failed. session_id=%lu error=%d",
+                                        session->session_id,
+                                        WSAGetLastError()
+                                    );
+                                    loop_result = -1;
+                                    goto cleanup;
+                                }
+
+                                session_context_add_bytes_to_client(
+                                    session,
+                                    block_response_sent
+                                );
+
+                                loop_result = 0;
+                                goto cleanup;
+                            }
+                            else if (dlp_result.action == DLP_ACTION_LOG_ONLY) {
+                                log_security(
+                                    "DLP response log-only rule matched. session_id=%lu",
+                                    session->session_id
+                                );
+                                log_security(
+                                    "Matched rule id: session_id=%lu rule_id=%d",
+                                    session->session_id,
+                                    dlp_result.matched_rule_id
+                                );
+                                log_security(
+                                    "Matched keyword: session_id=%lu keyword=%s",
+                                    session->session_id,
+                                    dlp_result.keyword
+                                );
+                                log_security(
+                                    "Reason: session_id=%lu reason=%s",
+                                    session->session_id,
+                                    dlp_result.reason
+                                );
+
+                                audit_log_response_log_only_event(session, response_for_dlp, &dlp_result);
+                            }
+                        }
+                        else {
+                            log_debug(
+                                "Received data could not be parsed as HTTP response. session_id=%lu",
+                                session->session_id
+                            );
+                        }
+
+                        if (send_all(client_sock, response_data, complete_response_length) == SOCKET_ERROR) {
+                            log_error(
+                                "send_all() to client failed. session_id=%lu error=%d",
+                                session->session_id,
+                                WSAGetLastError()
+                            );
+                            loop_result = -1;
+                            goto cleanup;
+                        }
+
+                        session_context_add_bytes_to_client(
+                            session,
+                            complete_response_length
+                        );
+
+                        log_debug(
+                            "PROXY -> CLIENT: session_id=%lu %d bytes forwarded",
+                            session->session_id,
+                            complete_response_length
+                        );
+
+                        response_buffer_consume(
+                            &response_buffer,
+                            complete_response_length
+                        );
+                    }
+                }
+            }
+            else if (recv_len == 0) {
+                int remaining_length = response_buffer_length(&response_buffer);
+
+                if (remaining_length > 0) {
+                    const char* remaining_data = response_buffer_data(&response_buffer);
+
+                    log_warn(
+                        "upstream disconnected with remaining response buffer. session_id=%lu forwarding raw %d bytes",
+                        session->session_id,
+                        remaining_length
+                    );
+
+                    if (send_all(client_sock, remaining_data, remaining_length) == SOCKET_ERROR) {
+                        log_error(
+                            "send_all() remaining response to client failed. session_id=%lu error=%d",
+                            session->session_id,
+                            WSAGetLastError()
+                        );
+                        loop_result = -1;
+                        goto cleanup;
+                    }
+
+                    session_context_add_bytes_to_client(session, remaining_length);
+                    response_buffer_consume(&response_buffer, remaining_length);
+                }
+
+                log_info(
+                    "upstream server disconnected. session_id=%lu",
+                    session->session_id
+                );
+                loop_result = 0;
+                break;
+            }
+            else {
+                log_error(
+                    "recv() from upstream failed. session_id=%lu error=%d",
+                    session->session_id,
+                    WSAGetLastError()
+                );
+                loop_result = -1;
+                break;
+            }
+        }
+    }
+
+cleanup:
+    close_socket_safe(&upstream_sock);
+
+    return loop_result;
+}
+
+int handle_client_session(proxy_session_context_t* session)
+{
+    int relay_result;
+
+    if (session == NULL) {
+        log_error("handle_client_session() received NULL session");
+        return -1;
+    }
+
+    session_context_log_started(session);
+
+    relay_result = relay_loop(session);
+
+    if (relay_result == 0) {
+        log_info(
+            "relay_loop finished normally. session_id=%lu",
+            session->session_id
+        );
+    }
+    else {
+        log_error(
+            "relay_loop finished with error. session_id=%lu",
+            session->session_id
+        );
+    }
+
+    close_socket_safe(&session->client_sock);
+
+    session_context_log_finished(session);
+
+    return relay_result;
+}
+
+static unsigned __stdcall client_thread_proc(void* arg)
+{
+    proxy_session_context_t* session;
+
+    session = (proxy_session_context_t*)arg;
+
+    if (session == NULL) {
+        log_error("client_thread_proc() received NULL session");
+        return 1;
+    }
+
+    session_context_set_thread_id(
+        session,
+        (unsigned int)GetCurrentThreadId()
+    );
+
+    log_info(
+        "client thread started. session_id=%lu thread_id=%u",
+        session->session_id,
+        session->thread_id
+    );
+
+    handle_client_session(session);
+
+    log_info(
+        "client thread finished. session_id=%lu thread_id=%u",
+        session->session_id,
+        session->thread_id
+    );
+
+    free(session);
+
+    return 0;
+}
+
+
+static SOCKET create_exclusive_listener(int port)
+{
+    SOCKET listen_sock = INVALID_SOCKET;
+    struct sockaddr_in addr;
+    BOOL exclusive = TRUE;
+    int bind_result;
+    int listen_result;
+
+    listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listen_sock == INVALID_SOCKET) {
+        log_error("socket() failed while creating listener. wsa_error=%d", WSAGetLastError());
+        return INVALID_SOCKET;
+    }
+
+    /*
+     * Windows-specific safety option.
+     *
+     * Do NOT use SO_REUSEADDR for this proxy listener on Windows.
+     * SO_REUSEADDR can allow another relay_proxy.exe instance to bind/listen
+     * on the same port, which makes logs appear in a different console than
+     * the one the developer is watching.
+     *
+     * SO_EXCLUSIVEADDRUSE makes the second process fail immediately if port
+     * 8000 is already in use.
+     */
+    if (setsockopt(
+            listen_sock,
+            SOL_SOCKET,
+            SO_EXCLUSIVEADDRUSE,
+            (const char*)&exclusive,
+            sizeof(exclusive)
+        ) == SOCKET_ERROR) {
+        log_error(
+            "setsockopt(SO_EXCLUSIVEADDRUSE) failed. wsa_error=%d",
+            WSAGetLastError()
+        );
+        closesocket(listen_sock);
+        return INVALID_SOCKET;
+    }
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons((u_short)port);
+
+    bind_result = bind(listen_sock, (struct sockaddr*)&addr, sizeof(addr));
+    if (bind_result == SOCKET_ERROR) {
+        int wsa_error = WSAGetLastError();
+
+        if (wsa_error == WSAEADDRINUSE) {
+            log_error(
+                "bind() failed: port %d is already in use. "
+                "Another relay_proxy.exe instance may still be running. "
+                "Run: netstat -ano | findstr :%d",
+                port,
+                port
+            );
+        }
+        else {
+            log_error(
+                "bind() failed for listener port %d. wsa_error=%d",
+                port,
+                wsa_error
+            );
+        }
+
+        closesocket(listen_sock);
+        return INVALID_SOCKET;
+    }
+
+    listen_result = listen(listen_sock, SOMAXCONN);
+    if (listen_result == SOCKET_ERROR) {
+        log_error(
+            "listen() failed for listener port %d. wsa_error=%d",
+            port,
+            WSAGetLastError()
+        );
+        closesocket(listen_sock);
+        return INVALID_SOCKET;
+    }
+
+    log_info(
+        "exclusive listener created. pid=%lu port=%d bind_address=0.0.0.0",
+        (unsigned long)GetCurrentProcessId(),
+        port
+    );
+
+    return listen_sock;
+}
+
+int main(void)
+{
+    WSADATA wsaData;
+
+    SOCKET listen_sock = INVALID_SOCKET;
+
+    char cwd[512];
+
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        printf("[ERROR] WSAStartup failed\n");
+        return 1;
+    }
+
+    if (_getcwd(cwd, sizeof(cwd)) != NULL) {
+        printf("[CWD] %s\n", cwd);
+    }
+    else {
+        printf("[WARN] failed to get current working directory\n");
+    }
+
+    if (logger_init("relay_runtime.log") != 0) {
+        printf("[WARN] logger_init failed. continue without file logging.\n");
+    }
+
+    if (policy_engine_init(POLICY_FILE_PATH) != 0) {
+        log_warn("policy_engine_init() failed. continue with available policy rules.");
+    }
+
+#if ENABLE_TLS_MITM
+    if (tls_intercept_policy_load(TLS_INTERCEPT_POLICY_FILE_PATH) != 0) {
+        log_warn("tls_intercept_policy_load() failed. continue with safe default TLS intercept policy.");
+    }
+#endif
+
+    if (command_thread_start(POLICY_FILE_PATH) != 0) {
+        log_warn("command_thread_start() failed. policy reload command is disabled.");
+    }
+
+    log_info("relay_proxy process started. pid=%lu", (unsigned long)GetCurrentProcessId());
+
+    listen_sock = create_exclusive_listener(PROXY_PORT);
+    if (listen_sock == INVALID_SOCKET) {
+        log_error("create_exclusive_listener() failed. Check whether another relay_proxy.exe is already using port %d", PROXY_PORT);
+
+        tls_intercept_policy_cleanup();
+        policy_engine_cleanup();
+        logger_close();
+        WSACleanup();
+
+        return 1;
+    }
+
+    log_info("Relay proxy listening on port %d...", PROXY_PORT);
+    log_info("Dynamic upstream mode enabled. Upstream is resolved from HTTP Host header.");
+    #if ENABLE_TLS_MITM
+    log_info("CONNECT TLS MITM mode enabled with TLS intercept policy. Policy actions: MITM, BYPASS, BLOCK, AUDIT, IGNORE.");
+    log_info("CONNECT TLS intercept policy file: %s", TLS_INTERCEPT_POLICY_FILE_PATH);
+#else
+    log_info("CONNECT tunnel mode enabled. CONNECT traffic is relayed as raw encrypted TCP.");
+#endif
+
+    while (1) {
+        SOCKET client_sock = INVALID_SOCKET;
+        struct sockaddr_in client_addr;
+        int client_addr_len = sizeof(client_addr);
+
+        proxy_session_context_t* session;
+        uintptr_t thread_handle;
+        unsigned int thread_id;
+
+        memset(&client_addr, 0, sizeof(client_addr));
+
+        log_info("waiting for client connection...");
+
+        client_sock = accept(
+            listen_sock,
+            (struct sockaddr*)&client_addr,
+            &client_addr_len
+        );
+
+        if (client_sock == INVALID_SOCKET) {
+            log_error("accept() failed: %d", WSAGetLastError());
+            continue;
+        }
+
+        session = (proxy_session_context_t*)malloc(sizeof(proxy_session_context_t));
+        if (session == NULL) {
+            log_error("malloc() failed for proxy_session_context_t");
+            close_socket_safe(&client_sock);
+            continue;
+        }
+
+        session_context_init(
+            session,
+            client_sock,
+            &client_addr,
+            NULL,
+            0
+        );
+
+        session_context_log_created(session);
+
+        {
+            process_metadata_t process_metadata;
+
+            process_metadata_init(&process_metadata);
+
+            if (process_metadata_lookup_tcp_owner(
+                session->client_ip,
+                session->client_port,
+                session->proxy_ip,
+                session->proxy_port,
+                &process_metadata
+            ) == 0) {
+                session_context_set_process_metadata(session, &process_metadata);
+                process_metadata_log(session->session_id, &process_metadata);
+            }
+            else {
+                log_warn(
+                    "failed to lookup process metadata. session_id=%lu client=%s:%d proxy=%s:%d",
+                    session->session_id,
+                    session->client_ip,
+                    session->client_port,
+                    session->proxy_ip,
+                    session->proxy_port
+                );
+            }
+        }
+
+        thread_id = 0;
+
+        thread_handle = _beginthreadex(
+            NULL,
+            0,
+            client_thread_proc,
+            session,
+            0,
+            &thread_id
+        );
+
+        if (thread_handle == 0) {
+            log_error(
+                "_beginthreadex() failed. session_id=%lu",
+                session->session_id
+            );
+
+            close_socket_safe(&client_sock);
+            free(session);
+
+            continue;
+        }
+
+        log_info(
+            "client thread created. session_id=%lu thread_id=%u",
+            session->session_id,
+            thread_id
+        );
+
+        CloseHandle((HANDLE)thread_handle);
+    }
+
+    close_socket_safe(&listen_sock);
+
+    log_info("relay proxy terminated");
+
+#if ENABLE_TLS_MITM
+    tls_intercept_policy_cleanup();
+#endif
+    policy_engine_cleanup();
+    logger_close();
+    WSACleanup();
+
+    return 0;
+}
