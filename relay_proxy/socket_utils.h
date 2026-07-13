@@ -11,7 +11,7 @@
 
 int send_all(SOCKET sock, const char* data, int length);
 void close_socket_safe(SOCKET* sock);
-SOCKET create_listener(int port);
-SOCKET connect_upstream(const char* ip, int port);
+SOCKET create_listener(unsigned short port);
+SOCKET connect_upstream(const char* ip, unsigned short port);
 
 #endif

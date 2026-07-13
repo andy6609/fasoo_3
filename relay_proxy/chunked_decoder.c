@@ -609,6 +609,8 @@ int chunked_decoder_prepare_request_for_dlp(
     }
     decoded_request->body[copy_length] = '\0';
     decoded_request->content_length = copy_length;
+    decoded_request->body_data = decoded_request->body;
+    decoded_request->body_data_length = copy_length;
 
     log_info(
         "Decoded chunked HTTP request body for DLP. context=%s decoded_body_bytes=%d copied_bytes=%d",

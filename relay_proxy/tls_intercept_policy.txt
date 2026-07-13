@@ -34,6 +34,11 @@ demo.local:9443 MITM local_browser_test
 127.0.0.1:9443 MITM loopback_tls_test
 localhost:9443 MITM localhost_tls_test
 
+# Public, non-authenticated endpoints used by the automated real-site smoke tests.
+# Restrict MITM to curl so normal browser traffic to these sites remains untouched.
+curl.exe httpbin.org:443 MITM public_https_smoke_test
+python.exe httpbin.org:443 MITM public_https_smoke_test
+
 # Noise suppression rules for local development.
 # IGNORE still relays traffic as a raw encrypted tunnel, but suppresses CONNECT audit,
 # raw tunnel start, idle timeout, and raw tunnel summary logs for noisy background traffic.

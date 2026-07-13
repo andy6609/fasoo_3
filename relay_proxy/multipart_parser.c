@@ -4,6 +4,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <stdlib.h>
+#include <openssl/evp.h>
 
 #include "multipart_parser.h"
 #include "logger.h"
@@ -16,6 +17,14 @@
 #define MULTIPART_SCAN_CHUNK_BYTES 4096
 #define MULTIPART_RULE_MAX_FILE_SIZE 11
 #define REQUEST_BODY_FALLBACK_SCAN_BYTES (20 * 1024 * 1024)
+
+static int safe_set_result(
+    dlp_result_t* result,
+    int action,
+    int rule_id,
+    const char* keyword,
+    const char* reason
+);
 
 static int ascii_tolower_int(int ch)
 {
@@ -187,6 +196,72 @@ static size_t get_available_request_body_len(
      * which previously caused 0xc0000005 on multi-MB multipart uploads.
      */
     return bounded_strlen(body, limit);
+}
+
+static void sha256_hex(const char* data, size_t length, char output[65])
+{
+    EVP_MD_CTX* ctx;
+    unsigned char digest[EVP_MAX_MD_SIZE];
+    unsigned int digest_len;
+    unsigned int i;
+
+    output[0] = '\0';
+    ctx = EVP_MD_CTX_new();
+    if (ctx == NULL) {
+        return;
+    }
+    digest_len = 0;
+    if (EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) == 1 &&
+        EVP_DigestUpdate(ctx, data, length) == 1 &&
+        EVP_DigestFinal_ex(ctx, digest, &digest_len) == 1) {
+        for (i = 0; i < digest_len; ++i) {
+            _snprintf_s(output + (i * 2), 65 - (i * 2), _TRUNCATE, "%02x", digest[i]);
+        }
+    }
+    EVP_MD_CTX_free(ctx);
+}
+
+static const char* detect_file_signature(const unsigned char* data, size_t length)
+{
+    if (length >= 4 && data[0] == 0x50 && data[1] == 0x4b &&
+        ((data[2] == 0x03 && data[3] == 0x04) ||
+         (data[2] == 0x05 && data[3] == 0x06) ||
+         (data[2] == 0x07 && data[3] == 0x08))) return "zip";
+    if (length >= 5 && memcmp(data, "%PDF-", 5) == 0) return "pdf";
+    if (length >= 8 && memcmp(data, "\x89PNG\r\n\x1a\n", 8) == 0) return "png";
+    if (length >= 3 && data[0] == 0xff && data[1] == 0xd8 && data[2] == 0xff) return "jpeg";
+    if (length >= 6 && (memcmp(data, "GIF87a", 6) == 0 || memcmp(data, "GIF89a", 6) == 0)) return "gif";
+    if (length >= 2 && data[0] == 'M' && data[1] == 'Z') return "exe";
+    return "unknown";
+}
+
+static int signature_matches_extension(const char* signature, const char* ext)
+{
+    if (signature == NULL || ext == NULL || signature[0] == 'u') return 1;
+    if (_stricmp(signature, "zip") == 0)
+        return _stricmp(ext, ".zip") == 0 || _stricmp(ext, ".xlsx") == 0 ||
+               _stricmp(ext, ".docx") == 0 || _stricmp(ext, ".pptx") == 0;
+    if (_stricmp(signature, "jpeg") == 0) return _stricmp(ext, ".jpg") == 0 || _stricmp(ext, ".jpeg") == 0;
+    { char expected[24]; _snprintf_s(expected, sizeof(expected), _TRUNCATE, ".%s", signature); return _stricmp(ext, expected) == 0; }
+}
+
+static void extract_part_content_type(const char* header, size_t header_len, char* output, size_t output_size)
+{
+    const char* p;
+    const char* end;
+    size_t len;
+
+    output[0] = '\0';
+    p = find_text_ci_n(header, header_len, "Content-Type:");
+    if (p == NULL) return;
+    p += strlen("Content-Type:");
+    while (p < header + header_len && (*p == ' ' || *p == '\t')) ++p;
+    end = p;
+    while (end < header + header_len && *end != '\r' && *end != '\n') ++end;
+    len = (size_t)(end - p);
+    if (len >= output_size) len = output_size - 1;
+    memcpy(output, p, len);
+    output[len] = '\0';
 }
 
 static int block_large_multipart_request_if_needed(
@@ -535,6 +610,8 @@ static int part_body_sample_looks_like_email(
 
 static int inspect_one_file_part(
     const char* filename,
+    const char* field_name,
+    const char* part_content_type,
     const char* part_body,
     size_t part_body_len,
     dlp_result_t* result
@@ -547,6 +624,9 @@ static int inspect_one_file_part(
     size_t max_file_size;
     size_t max_scan_bytes;
     size_t scanned_bytes;
+    char hash[65];
+    const char* signature;
+    int signature_mismatch;
 
     if (filename == NULL || filename[0] == '\0' || part_body == NULL || result == NULL) {
         return 0;
@@ -559,14 +639,30 @@ static int inspect_one_file_part(
     base = filename_basename(filename);
     extract_file_extension(filename, ext, sizeof(ext));
 
+    sha256_hex(part_body, part_body_len, hash);
+    signature = detect_file_signature((const unsigned char*)part_body, part_body_len);
+    signature_mismatch = !signature_matches_extension(signature, ext);
+
     log_security(
-        "Multipart file upload detected. filename=%s extension=%s body_bytes=%lu max_file_bytes=%lu scan_limit_bytes=%lu",
+        "FILE_UPLOAD field=%s filename=%s extension=%s mime=%s size=%lu sha256=%s signature=%s signature_mismatch=%s max_file_bytes=%lu scan_limit_bytes=%lu",
+        field_name != NULL && field_name[0] != '\0' ? field_name : "-",
         base,
         ext[0] != '\0' ? ext : "-",
+        part_content_type != NULL && part_content_type[0] != '\0' ? part_content_type : "-",
         (unsigned long)part_body_len,
+        hash[0] != '\0' ? hash : "-",
+        signature,
+        signature_mismatch ? "true" : "false",
         (unsigned long)max_file_size,
         (unsigned long)max_scan_bytes
     );
+
+    if (signature_mismatch) {
+        _snprintf_s(reason, sizeof(reason), _TRUNCATE,
+            "Multipart upload blocked. file signature mismatch: %s extension=%s signature=%s",
+            base, ext[0] != '\0' ? ext : "-", signature);
+        return safe_set_result(result, DLP_ACTION_BLOCK, 12, "SIGNATURE_MISMATCH", reason);
+    }
 
     if (_stricmp(ext, ".zip") == 0) {
         _snprintf_s(
@@ -690,8 +786,8 @@ int inspect_multipart_upload_request(const http_request_t* request, dlp_result_t
         return 0;
     }
 
-    body = request->body;
-    if (body == NULL || body[0] == '\0') {
+    body = request->body_data != NULL ? request->body_data : request->body;
+    if (body == NULL) {
         return 0;
     }
 
@@ -699,7 +795,9 @@ int inspect_multipart_upload_request(const http_request_t* request, dlp_result_t
         return 1;
     }
 
-    body_len = get_available_request_body_len(request, body, REQUEST_BODY_FALLBACK_SCAN_BYTES);
+    body_len = request->body_data != NULL && request->body_data_length >= 0
+        ? (size_t)request->body_data_length
+        : get_available_request_body_len(request, body, REQUEST_BODY_FALLBACK_SCAN_BYTES);
 
     if (body_len == 0) {
         return 0;
@@ -737,6 +835,8 @@ int inspect_multipart_upload_request(const http_request_t* request, dlp_result_t
         size_t header_len;
         size_t part_body_len;
         char filename[MULTIPART_FILENAME_SIZE];
+        char field_name[128];
+        char part_content_type[128];
 
         remaining = (size_t)(body_end - cursor);
         boundary_pos = find_bytes_n(cursor, remaining, boundary_marker, boundary_marker_len);
@@ -783,9 +883,11 @@ int inspect_multipart_upload_request(const http_request_t* request, dlp_result_t
 
         part_body_len = (size_t)(part_end - part_body);
         extract_quoted_parameter(part_start, header_len, "filename", filename, sizeof(filename));
+        extract_quoted_parameter(part_start, header_len, "name", field_name, sizeof(field_name));
+        extract_part_content_type(part_start, header_len, part_content_type, sizeof(part_content_type));
 
         if (filename[0] != '\0') {
-            inspect_one_file_part(filename, part_body, part_body_len, result);
+            inspect_one_file_part(filename, field_name, part_content_type, part_body, part_body_len, result);
             if (result->action == DLP_ACTION_BLOCK) {
                 return inspected;
             }

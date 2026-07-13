@@ -305,6 +305,9 @@ int parse_http_request(const char* buffer, int length, http_request_t* request)
         body_length = 0;
     }
 
+    request->body_data = buffer + header_end;
+    request->body_data_length = body_length;
+
     if (body_length > HTTP_BODY_SIZE - 1) {
         body_length = HTTP_BODY_SIZE - 1;
     }

@@ -134,6 +134,7 @@
     <ClCompile Include="content_decoder.c" />
     <ClCompile Include="dlp_engine.c" />
     <ClCompile Include="http_block_response.c" />
+    <ClCompile Include="http2_engine.c" />
     <ClCompile Include="http_parser.c" />
     <ClCompile Include="http_response_parser.c" />
     <ClCompile Include="logger.c" />
@@ -160,6 +161,7 @@
     <ClInclude Include="content_decoder.h" />
     <ClInclude Include="dlp_engine.h" />
     <ClInclude Include="http_block_response.h" />
+    <ClInclude Include="http2_engine.h" />
     <ClInclude Include="http_parser.h" />
     <ClInclude Include="http_response_parser.h" />
     <ClInclude Include="logger.h" />

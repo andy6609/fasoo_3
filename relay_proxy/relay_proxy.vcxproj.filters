@@ -30,6 +30,9 @@
     <ClCompile Include="http_block_response.c">
       <Filter>소스 파일</Filter>
     </ClCompile>
+    <ClCompile Include="http2_engine.c">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
     <ClCompile Include="policy_engine.c">
       <Filter>소스 파일</Filter>
     </ClCompile>
@@ -99,6 +102,9 @@
       <Filter>헤더 파일</Filter>
     </ClInclude>
     <ClInclude Include="http_block_response.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
+    <ClInclude Include="http2_engine.h">
       <Filter>헤더 파일</Filter>
     </ClInclude>
     <ClInclude Include="policy_engine.h">

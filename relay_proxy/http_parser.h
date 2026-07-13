@@ -25,6 +25,9 @@ typedef struct http_request {
 
     char body[HTTP_BODY_SIZE];
     int body_length;
+    /* Full body view, valid while the source request buffer remains alive. */
+    const char* body_data;
+    int body_data_length;
 } http_request_t;
 
 int parse_http_request(const char* buffer, int length, http_request_t* request);

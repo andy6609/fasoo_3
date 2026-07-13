@@ -14,6 +14,7 @@
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <openssl/x509v3.h>
 
 #include "tls_mitm_engine.h"
 #include "logger.h"
@@ -27,6 +28,7 @@
 #include "multipart_parser.h"
 #include "content_decoder.h"
 #include "chunked_decoder.h"
+#include "http2_engine.h"
 
 #pragma comment(lib, "Ws2_32.lib")
 #pragma comment(lib, "libssl.lib")
@@ -36,6 +38,12 @@
 #define TLS_MITM_KEY_FILE  "certs\\mitm.key"
 #define TLS_MITM_BUFFER_SIZE 8192
 #define TLS_MITM_MAX_HOSTNAME 256
+#define TLS_MITM_INSECURE_UPSTREAM_ENV "LOCAL_DLP_ALLOW_INSECURE_UPSTREAM"
+
+typedef enum tls_mitm_app_protocol {
+    TLS_MITM_APP_PROTOCOL_HTTP11 = 0,
+    TLS_MITM_APP_PROTOCOL_HTTP2 = 1
+} tls_mitm_app_protocol_t;
 
 typedef struct tls_mitm_sni_context {
     proxy_session_context_t* session;
@@ -76,6 +84,27 @@ static void tls_mitm_log_openssl_error(const char* message)
     if (!has_error) {
         log_error("%s", message);
     }
+}
+
+static int tls_mitm_env_flag_enabled(const char* name)
+{
+    char value[16];
+    size_t required_size = 0;
+
+    if (name == NULL || name[0] == '\0') {
+        return 0;
+    }
+
+    value[0] = '\0';
+
+    if (getenv_s(&required_size, value, sizeof(value), name) != 0 || required_size == 0) {
+        return 0;
+    }
+
+    return _stricmp(value, "1") == 0 ||
+        _stricmp(value, "true") == 0 ||
+        _stricmp(value, "yes") == 0 ||
+        _stricmp(value, "on") == 0;
 }
 
 
@@ -262,7 +291,7 @@ static int tls_mitm_sni_callback(
 }
 
 
-static int tls_mitm_alpn_select_http11_cb(
+static int tls_mitm_alpn_select_supported_cb(
     SSL* ssl,
     const unsigned char** out,
     unsigned char* outlen,
@@ -271,7 +300,8 @@ static int tls_mitm_alpn_select_http11_cb(
     void* arg
 )
 {
-    static const unsigned char http11_proto[] = {
+    static const unsigned char supported_protos[] = {
+        2, 'h', '2',
         8, 'h', 't', 't', 'p', '/', '1', '.', '1'
     };
     int select_result;
@@ -286,8 +316,8 @@ static int tls_mitm_alpn_select_http11_cb(
     select_result = SSL_select_next_proto(
         (unsigned char**)out,
         outlen,
-        http11_proto,
-        sizeof(http11_proto),
+        supported_protos,
+        sizeof(supported_protos),
         in,
         inlen
     );
@@ -297,6 +327,56 @@ static int tls_mitm_alpn_select_http11_cb(
     }
 
     return SSL_TLSEXT_ERR_NOACK;
+}
+
+static tls_mitm_app_protocol_t tls_mitm_get_selected_app_protocol(SSL* ssl)
+{
+    const unsigned char* selected = NULL;
+    unsigned int selected_len = 0;
+
+    if (ssl == NULL) {
+        return TLS_MITM_APP_PROTOCOL_HTTP11;
+    }
+
+    SSL_get0_alpn_selected(ssl, &selected, &selected_len);
+
+    if (selected != NULL && selected_len == 2 && memcmp(selected, "h2", 2) == 0) {
+        return TLS_MITM_APP_PROTOCOL_HTTP2;
+    }
+
+    return TLS_MITM_APP_PROTOCOL_HTTP11;
+}
+
+static int tls_mitm_set_upstream_alpn(
+    SSL* upstream_ssl,
+    tls_mitm_app_protocol_t protocol
+)
+{
+    static const unsigned char h2_proto[] = {
+        2, 'h', '2'
+    };
+    static const unsigned char http11_proto[] = {
+        8, 'h', 't', 't', 'p', '/', '1', '.', '1'
+    };
+
+    if (upstream_ssl == NULL) {
+        return -1;
+    }
+
+    if (protocol == TLS_MITM_APP_PROTOCOL_HTTP2) {
+        if (SSL_set_alpn_protos(upstream_ssl, h2_proto, sizeof(h2_proto)) != 0) {
+            log_error("SSL_set_alpn_protos() failed. requested upstream ALPN=h2");
+            return -1;
+        }
+        return 0;
+    }
+
+    if (SSL_set_alpn_protos(upstream_ssl, http11_proto, sizeof(http11_proto)) != 0) {
+        log_error("SSL_set_alpn_protos() failed. requested upstream ALPN=http/1.1");
+        return -1;
+    }
+
+    return 0;
 }
 
 static void tls_mitm_log_selected_alpn(
@@ -376,9 +456,10 @@ static SSL_CTX* tls_mitm_create_server_ctx(void)
     /*
         Browser test mode:
         Modern browsers may offer h2 and http/1.1 through ALPN.
-        Our parser handles HTTP/1.1, so explicitly select http/1.1 when offered.
+        Prefer h2 when the client offers it, otherwise use HTTP/1.1.
+        HTTP/2 is inspected at the frame/DATA level; HTTP/1.1 keeps the existing parser path.
     */
-    SSL_CTX_set_alpn_select_cb(ctx, tls_mitm_alpn_select_http11_cb, NULL);
+    SSL_CTX_set_alpn_select_cb(ctx, tls_mitm_alpn_select_supported_cb, NULL);
 
     return ctx;
 }
@@ -395,29 +476,64 @@ static SSL_CTX* tls_mitm_create_client_ctx(void)
         return NULL;
     }
 
-    /*
-        POC note: the upstream test server uses a self-signed certificate,
-        so certificate verification is disabled here.
-        In a production design, verification and exception handling should be policy-driven.
-    */
-    SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+    if (tls_mitm_env_flag_enabled(TLS_MITM_INSECURE_UPSTREAM_ENV)) {
+        log_warn(
+            "TLS MITM upstream certificate verification is disabled by %s. Use only in local test environments.",
+            TLS_MITM_INSECURE_UPSTREAM_ENV
+        );
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+    }
+    else {
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
 
-    /*
-        Upstream browser-test mode:
-        Offer http/1.1 to the upstream server. If the upstream does not support ALPN,
-        the TLS handshake can still continue and the HTTP/1.1 parser remains valid for this POC.
-    */
-    {
-        static const unsigned char http11_proto[] = {
-            8, 'h', 't', 't', 'p', '/', '1', '.', '1'
-        };
-
-        if (SSL_CTX_set_alpn_protos(ctx, http11_proto, sizeof(http11_proto)) != 0) {
-            log_error("SSL_CTX_set_alpn_protos() failed. upstream ALPN will be omitted.");
+        if (SSL_CTX_set_default_verify_paths(ctx) != 1) {
+            tls_mitm_log_openssl_error("SSL_CTX_set_default_verify_paths() failed");
+            SSL_CTX_free(ctx);
+            return NULL;
         }
     }
 
     return ctx;
+}
+
+static int tls_mitm_configure_upstream_hostname_verification(
+    SSL* upstream_ssl,
+    const char* host
+)
+{
+    X509_VERIFY_PARAM* verify_param;
+
+    if (upstream_ssl == NULL || host == NULL || host[0] == '\0') {
+        return -1;
+    }
+
+    if (tls_mitm_env_flag_enabled(TLS_MITM_INSECURE_UPSTREAM_ENV)) {
+        return 0;
+    }
+
+    verify_param = SSL_get0_param(upstream_ssl);
+    if (verify_param == NULL) {
+        log_error("TLS MITM failed to get upstream verification parameters. host=%s", host);
+        return -1;
+    }
+
+    X509_VERIFY_PARAM_set_hostflags(verify_param, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+
+    if (cert_manager_is_ip_literal(host)) {
+        if (X509_VERIFY_PARAM_set1_ip_asc(verify_param, host) != 1) {
+            log_error("TLS MITM failed to configure upstream IP certificate verification. host=%s", host);
+            return -1;
+        }
+    }
+    else {
+        if (X509_VERIFY_PARAM_set1_host(verify_param, host, 0) != 1) {
+            log_error("TLS MITM failed to configure upstream hostname certificate verification. host=%s", host);
+            return -1;
+        }
+    }
+
+    log_info("TLS MITM upstream certificate verification enabled. host=%s", host);
+    return 0;
 }
 
 static int ssl_write_all(SSL* ssl, const char* data, int length)
@@ -569,6 +685,14 @@ static int tls_read_complete_http_request(
         read_len = SSL_read(client_ssl, buffer, sizeof(buffer));
         if (read_len <= 0) {
             int ssl_error = SSL_get_error(client_ssl, read_len);
+
+            if (ssl_error == SSL_ERROR_ZERO_RETURN) {
+                log_info(
+                    "TLS MITM client closed TLS connection cleanly. session_id=%lu",
+                    session->session_id
+                );
+                return 0;
+            }
 
             log_error(
                 "TLS MITM SSL_read() from client failed. session_id=%lu ssl_error=%d",
@@ -863,14 +987,17 @@ static int tls_mitm_process_one_http_request_response(
         exchange_index
     );
 
-    if (tls_read_complete_http_request(
-        session,
-        client_ssl,
-        request_buffer,
-        &complete_request_length
-    ) != 1) {
-        function_result = -1;
-        goto cleanup;
+    {
+        int request_read_result = tls_read_complete_http_request(
+            session,
+            client_ssl,
+            request_buffer,
+            &complete_request_length
+        );
+        if (request_read_result != 1) {
+            function_result = request_read_result == 0 ? 0 : -1;
+            goto cleanup;
+        }
     }
 
     request_data = request_buffer_data(request_buffer);
@@ -1224,6 +1351,7 @@ int tls_mitm_handle_connect_session(
     char connect_host[TLS_MITM_MAX_HOSTNAME];
     char client_sni[TLS_MITM_MAX_HOSTNAME];
     char upstream_sni[TLS_MITM_MAX_HOSTNAME];
+    tls_mitm_app_protocol_t app_protocol = TLS_MITM_APP_PROTOCOL_HTTP11;
 
     tls_mitm_sni_context_t sni_context;
 
@@ -1321,6 +1449,7 @@ int tls_mitm_handle_connect_session(
     );
 
     tls_mitm_log_selected_alpn(session, client_ssl, "client");
+    app_protocol = tls_mitm_get_selected_app_protocol(client_ssl);
 
     if (sni_context.selected_sni[0] != '\0') {
         tls_mitm_copy_string(
@@ -1369,6 +1498,10 @@ int tls_mitm_handle_connect_session(
         goto cleanup;
     }
 
+    if (tls_mitm_set_upstream_alpn(upstream_ssl, app_protocol) != 0) {
+        goto cleanup;
+    }
+
     if (client_sni[0] != '\0') {
         tls_mitm_copy_string(
             upstream_sni,
@@ -1404,9 +1537,48 @@ int tls_mitm_handle_connect_session(
         );
     }
 
+    if (upstream_sni[0] != '\0') {
+        if (tls_mitm_configure_upstream_hostname_verification(upstream_ssl, upstream_sni) != 0) {
+            goto cleanup;
+        }
+    }
+    else if (connect_host[0] != '\0') {
+        if (tls_mitm_configure_upstream_hostname_verification(upstream_ssl, connect_host) != 0) {
+            goto cleanup;
+        }
+    }
+    else if (!tls_mitm_env_flag_enabled(TLS_MITM_INSECURE_UPSTREAM_ENV)) {
+        log_error(
+            "TLS MITM upstream certificate verification failed before handshake. session_id=%lu reason=no hostname",
+            session->session_id
+        );
+        goto cleanup;
+    }
+
     if (SSL_connect(upstream_ssl) != 1) {
         tls_mitm_log_openssl_error("SSL_connect() to upstream failed");
         goto cleanup;
+    }
+
+    if (!tls_mitm_env_flag_enabled(TLS_MITM_INSECURE_UPSTREAM_ENV)) {
+        long verify_result = SSL_get_verify_result(upstream_ssl);
+
+        if (verify_result != X509_V_OK) {
+            log_error(
+                "TLS MITM upstream certificate verification failed. session_id=%lu host=%s verify_result=%ld error=%s",
+                session->session_id,
+                upstream_sni[0] != '\0' ? upstream_sni : connect_host,
+                verify_result,
+                X509_verify_cert_error_string(verify_result)
+            );
+            goto cleanup;
+        }
+
+        log_info(
+            "TLS MITM upstream certificate verified. session_id=%lu host=%s",
+            session->session_id,
+            upstream_sni[0] != '\0' ? upstream_sni : connect_host
+        );
     }
 
     log_info(
@@ -1425,7 +1597,23 @@ int tls_mitm_handle_connect_session(
 
     tls_mitm_log_selected_alpn(session, upstream_ssl, "upstream");
 
-    {
+    if (app_protocol == TLS_MITM_APP_PROTOCOL_HTTP2 &&
+        tls_mitm_get_selected_app_protocol(upstream_ssl) == TLS_MITM_APP_PROTOCOL_HTTP2) {
+        result = http2_engine_relay_loop(
+            session,
+            client_ssl,
+            upstream_ssl,
+            upstream_sock
+        );
+    }
+    else if (app_protocol == TLS_MITM_APP_PROTOCOL_HTTP2) {
+        log_error(
+            "TLS MITM HTTP/2 was selected by client but upstream did not negotiate h2. session_id=%lu",
+            session->session_id
+        );
+        result = -1;
+    }
+    else {
         int exchange_index = 1;
 
         while (1) {

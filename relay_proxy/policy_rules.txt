@@ -9,3 +9,4 @@
 8|LOG_ONLY|FILE_EXT|.xlsx|Excel file upload blocked
 9|BLOCK|FILE_EXT|.zip|Zip file upload blocked
 10|LOG_ONLY|FILE_UPLOAD|-|File upload detected. log only
+# Built-in multipart rule IDs: 11=MAX_FILE_SIZE, 12=SIGNATURE_MISMATCH
