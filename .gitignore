@@ -37,3 +37,10 @@ ipch/
 # CMake build folders, if used
 out/
 build/
+
+# Decrypted request-body captures can contain sensitive file contents.
+relay_proxy/upload_captures/
+
+# Per-host TLS certificates and private keys are generated at runtime.
+# Existing legacy files remain tracked, but new host credentials must never be committed.
+relay_proxy/certs/generated/

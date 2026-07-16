@@ -1,90 +1,52 @@
-# TLS intercept policy for Local DLP proxy
+# File-only AI upload interception policy
 #
-# Supported formats:
-#   <target> <action> [reason]
-#   <process> <target> <action> [reason]
-#   DEFAULT <action> [reason]
+# Only browser traffic for ChatGPT, Gemini, and Claude is decrypted. The DLP
+# engine separately ignores ordinary chat JSON, telemetry, and response bodies.
+# Everything else uses a silent raw TLS tunnel and is never content-inspected.
 #
-# process examples:
-#   chrome.exe
-#   devenv.exe
-#   msedgewebview2.exe
-#   *.exe
-#   *
-#
-# target examples:
-#   demo.local:9443
-#   chatgpt.com:443
-#   *.openai.com:443
-#   *:443
-#   *
-#
-# action values:
-#   MITM    = decrypt HTTPS, inspect request/response body with DLP
-#   BYPASS  = raw encrypted tunnel, metadata/audit only
-#   AUDIT   = raw encrypted tunnel, but explicit security audit policy decision
-#   IGNORE  = raw encrypted tunnel with noise-suppressed tunnel logs and summaries
-#   BLOCK   = deny CONNECT before upstream connection
-#
-# Rules are evaluated from top to bottom. First match wins.
-# Process-specific rules should be placed before broad wildcard rules.
+# Format: <process> <target> <action> [reason]
 
-# Local browser test targets. These match any process.
-demo.local:9443 MITM local_browser_test
-127.0.0.1:9443 MITM loopback_tls_test
-localhost:9443 MITM localhost_tls_test
+# Local browser test server
+chrome.exe demo.local:9443 MITM local_browser_test
+chrome.exe 127.0.0.1:9443 MITM local_browser_test
+chrome.exe localhost:9443 MITM local_browser_test
+msedge.exe demo.local:9443 MITM local_browser_test
+msedge.exe 127.0.0.1:9443 MITM local_browser_test
+msedge.exe localhost:9443 MITM local_browser_test
+firefox.exe demo.local:9443 MITM local_browser_test
+firefox.exe 127.0.0.1:9443 MITM local_browser_test
+firefox.exe localhost:9443 MITM local_browser_test
 
-# Public, non-authenticated endpoints used by the automated real-site smoke tests.
-# Restrict MITM to curl so normal browser traffic to these sites remains untouched.
-curl.exe httpbin.org:443 MITM public_https_smoke_test
-python.exe httpbin.org:443 MITM public_https_smoke_test
+# ChatGPT / OpenAI
+chrome.exe chatgpt.com:443 MITM ai_file_upload_only
+chrome.exe *.openai.com:443 MITM ai_file_upload_only
+chrome.exe *.oaiusercontent.com:443 MITM ai_file_upload_only
+msedge.exe chatgpt.com:443 MITM ai_file_upload_only
+msedge.exe *.openai.com:443 MITM ai_file_upload_only
+msedge.exe *.oaiusercontent.com:443 MITM ai_file_upload_only
+firefox.exe chatgpt.com:443 MITM ai_file_upload_only
+firefox.exe *.openai.com:443 MITM ai_file_upload_only
+firefox.exe *.oaiusercontent.com:443 MITM ai_file_upload_only
+brave.exe chatgpt.com:443 MITM ai_file_upload_only
+brave.exe *.openai.com:443 MITM ai_file_upload_only
+brave.exe *.oaiusercontent.com:443 MITM ai_file_upload_only
 
-# Noise suppression rules for local development.
-# IGNORE still relays traffic as a raw encrypted tunnel, but suppresses CONNECT audit,
-# raw tunnel start, idle timeout, and raw tunnel summary logs for noisy background traffic.
-fSyncClient.exe *:443 IGNORE fasoo_wrapsody_sync_noise_suppression
-fdso.exe * IGNORE fasoo_drm_heartbeat_noise_suppression
-Notion.exe *:443 IGNORE notion_background_noise_suppression
-PerfWatson2.exe *:443 IGNORE visual_studio_perfwatson_noise_suppression
-msedgewebview2.exe outlook.office.com:443 IGNORE outlook_webview_noise_suppression
-chrome.exe signaler-pa.clients6.google.com:443 IGNORE chrome_signaler_background_noise
-chrome.exe ogads-pa.clients6.google.com:443 IGNORE chrome_ads_background_noise
-chrome.exe api.coinbase.com:443 IGNORE chrome_coinbase_extension_noise
-chrome.exe api.wallet.coinbase.com:443 IGNORE chrome_coinbase_wallet_extension_noise
-chrome.exe www.youtube.com:443 IGNORE chrome_youtube_background_noise
+# Google Gemini. Other Google services remain raw and uninspected.
+chrome.exe gemini.google.com:443 MITM ai_file_upload_only
+msedge.exe gemini.google.com:443 MITM ai_file_upload_only
+firefox.exe gemini.google.com:443 MITM ai_file_upload_only
+brave.exe gemini.google.com:443 MITM ai_file_upload_only
 
-# Process-aware examples for enterprise DLP policy.
-# Keep these as AUDIT for now so real services do not break during development.
-chrome.exe chatgpt.com:443 AUDIT chrome_ai_service_metadata_audit
-chrome.exe *.openai.com:443 AUDIT chrome_openai_metadata_audit
-chrome.exe raw.githubusercontent.com:443 AUDIT chrome_raw_github_metadata_audit
-devenv.exe github.com:443 AUDIT visual_studio_github_metadata_audit
-devenv.exe *.github.com:443 AUDIT visual_studio_github_metadata_audit
-msedgewebview2.exe outlook.office.com:443 BYPASS outlook_webview_exception
+# Anthropic Claude
+chrome.exe claude.ai:443 MITM ai_file_upload_only
+chrome.exe *.anthropic.com:443 MITM ai_file_upload_only
+msedge.exe claude.ai:443 MITM ai_file_upload_only
+msedge.exe *.anthropic.com:443 MITM ai_file_upload_only
+firefox.exe claude.ai:443 MITM ai_file_upload_only
+firefox.exe *.anthropic.com:443 MITM ai_file_upload_only
+brave.exe claude.ai:443 MITM ai_file_upload_only
+brave.exe *.anthropic.com:443 MITM ai_file_upload_only
 
-# Future enterprise MITM examples.
-# Uncomment only after compression, HTTP/2 handling, pinning exceptions, and service-specific parsing are ready.
-# chrome.exe chatgpt.com:443 MITM ai_service_inspection
-# chrome.exe *.openai.com:443 MITM ai_service_inspection
-# chrome.exe drive.google.com:443 MITM cloud_upload_inspection
-# chrome.exe mail.google.com:443 MITM webmail_inspection
-# devenv.exe github.com:443 MITM source_code_leakage_inspection
-
-# Auth/browser/system traffic often needs bypass or dedicated exceptions.
-chrome.exe accounts.google.com:443 BYPASS auth_service_exception
-chrome.exe oauthaccountmanager.googleapis.com:443 BYPASS auth_service_exception
-chrome.exe safebrowsing.google.com:443 BYPASS browser_safety_service_exception
-chrome.exe clients4.google.com:443 BYPASS chrome_sync_service_exception
-chrome.exe optimizationguide-pa.googleapis.com:443 BYPASS chrome_optimization_service_exception
-chrome.exe content-autofill.googleapis.com:443 BYPASS chrome_autofill_service_exception
-chrome.exe play.google.com:443 BYPASS browser_background_service_exception
-
-# Process-specific block examples. Keep commented unless you want to test process blocking.
-# unknown.exe *:443 BLOCK unknown_process_block
-# suspicious.exe * BLOCK suspicious_process_block
-
-# Destination block example. Keep commented unless you want to test destination blocking.
-# * blocked.example.com:443 BLOCK blocked_destination_example
-
-# Default for unknown CONNECT traffic.
-DEFAULT BYPASS safe_default_for_unknown_https
+# All non-AI sites, desktop applications, authentication services, browser
+# background traffic, and unknown destinations pass through without decryption.
+DEFAULT IGNORE non_ai_passthrough

@@ -8,6 +8,20 @@
 #include "http_parser.h"
 #include "logger.h"
 
+static void make_safe_log_path(const char* path, char* output, size_t output_size)
+{
+    const char* query;
+    size_t length;
+    if (output == NULL || output_size == 0) return;
+    output[0] = '\0';
+    if (path == NULL) return;
+    query = strchr(path, '?');
+    length = query != NULL ? (size_t)(query - path) : strlen(path);
+    if (length >= output_size) length = output_size - 1;
+    memcpy(output, path, length);
+    output[length] = '\0';
+}
+
 #define HTTP_HEADER_BUFFER_SIZE 8192
 
 static int find_header_end(const char* buffer, int length)
@@ -323,13 +337,15 @@ int parse_http_request(const char* buffer, int length, http_request_t* request)
 
 void print_http_request(const http_request_t* request)
 {
+    char safe_path[HTTP_PATH_SIZE];
     if (request == NULL) {
         return;
     }
 
     printf("\n[HTTP REQUEST]\n");
     printf("Method : %s\n", request->method);
-    printf("Path   : %s\n", request->path);
+    make_safe_log_path(request->path, safe_path, sizeof(safe_path));
+    printf("Path   : %s\n", safe_path);
     printf("Version: %s\n", request->version);
     printf("Host   : %s\n", request->host);
 
@@ -368,14 +384,16 @@ void log_http_request_analysis(
 {
     int i;
     char body_preview[768];
+    char safe_path[HTTP_PATH_SIZE];
 
     if (request == NULL) {
         return;
     }
 
+    make_safe_log_path(request->path, safe_path, sizeof(safe_path));
     log_info(
         "HTTP_ANALYSIS direction=REQUEST session_id=%lu transport=%s method=%s path=%s host=%s content_type=%s content_length=%d headers=%d%s body_bytes=%d",
-        session_id, transport != NULL ? transport : "-", request->method, request->path,
+        session_id, transport != NULL ? transport : "-", request->method, safe_path,
         request->host[0] != '\0' ? request->host : "-",
         request->content_type[0] != '\0' ? request->content_type : "-",
         request->content_length, request->header_count,
@@ -384,7 +402,7 @@ void log_http_request_analysis(
 
     for (i = 0; i < request->header_count; i++) {
         const http_header_t* header = &request->headers[i];
-        log_info(
+        log_debug(
             "HTTP_ANALYSIS direction=REQUEST session_id=%lu header=%s value=%s%s",
             session_id, header->name,
             header_is_sensitive(header->name) ? "[REDACTED]" : header->value,
@@ -393,17 +411,17 @@ void log_http_request_analysis(
     }
 
     if (request->body_length <= 0) {
-        log_info("HTTP_ANALYSIS direction=REQUEST session_id=%lu body=-", session_id);
+        log_debug("HTTP_ANALYSIS direction=REQUEST session_id=%lu body=-", session_id);
     }
     else if (!content_type_is_textual(request->content_type)) {
-        log_info("HTTP_ANALYSIS direction=REQUEST session_id=%lu body=[binary or unsupported content type omitted]", session_id);
+        log_debug("HTTP_ANALYSIS direction=REQUEST session_id=%lu body=[binary or unsupported content type omitted]", session_id);
     }
     else if (body_may_be_sensitive(request->body)) {
-        log_info("HTTP_ANALYSIS direction=REQUEST session_id=%lu body=[REDACTED: sensitive field detected]", session_id);
+        log_debug("HTTP_ANALYSIS direction=REQUEST session_id=%lu body=[REDACTED: sensitive field detected]", session_id);
     }
     else {
         make_log_preview(request->body, request->body_length, body_preview, sizeof(body_preview));
-        log_info("HTTP_ANALYSIS direction=REQUEST session_id=%lu body_preview=%s%s", session_id,
+        log_debug("HTTP_ANALYSIS direction=REQUEST session_id=%lu body_preview=%s%s", session_id,
             body_preview, request->body_length >= (int)sizeof(body_preview) ? " [truncated]" : "");
     }
 }

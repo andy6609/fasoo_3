@@ -1,12 +1,14 @@
+# File-only DLP rules. Ordinary chat JSON, telemetry, response bodies, and
+# personal-information patterns are not inspected.
 # rule_id|action|type|pattern|reason
-1|BLOCK|KEYWORD|secret|Sensitive keyword detected: secret
-2|BLOCK|KEYWORD|password|Password keyword detected
-3|LOG_ONLY|KEYWORD|confidential|Confidential keyword detected. log only
-4|BLOCK|EMAIL|-|Email address detected
-5|BLOCK|PHONE|-|Phone number detected
-6|BLOCK|RESIDENT_ID|-|Resident ID pattern detected
-7|BLOCK|CREDIT_CARD|-|Credit card pattern detected
-8|LOG_ONLY|FILE_EXT|.xlsx|Excel file upload blocked
-9|BLOCK|FILE_EXT|.zip|Zip file upload blocked
-10|LOG_ONLY|FILE_UPLOAD|-|File upload detected. log only
-# Built-in multipart rule IDs: 11=MAX_FILE_SIZE, 12=SIGNATURE_MISMATCH
+1|BLOCK|FILE_EXT|.exe|Executable file upload blocked
+2|BLOCK|FILE_EXT|.dll|DLL file upload blocked
+3|BLOCK|FILE_EXT|.msi|Installer file upload blocked
+4|BLOCK|FILE_EXT|.bat|Batch script upload blocked
+5|BLOCK|FILE_EXT|.cmd|Command script upload blocked
+6|BLOCK|FILE_EXT|.ps1|PowerShell script upload blocked
+7|BLOCK|FILE_EXT|.vbs|VBScript upload blocked
+8|BLOCK|FILE_EXT|.scr|Screen saver executable upload blocked
+9|BLOCK|FILE_EXT|.com|Executable command upload blocked
+10|LOG_ONLY|FILE_UPLOAD|-|File upload detected and allowed
+# Built-in multipart rule ID: 12=SIGNATURE_MISMATCH

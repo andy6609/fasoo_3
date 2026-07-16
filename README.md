@@ -2,7 +2,7 @@
 
 ## Overview
 
-TCP Proxy Lab is a Windows-based C/C++ proxy research project built with Visual Studio. It started as a simple TCP relay exercise and expanded into a local HTTP/HTTPS proxy with DLP inspection, policy-based blocking, TLS MITM support, multipart upload detection, and audit logging.
+TCP Proxy Lab is a Windows-based C/C++ research proxy for file-only DLP on AI websites. Normal websites pass through without TLS decryption. Selected browser traffic for ChatGPT, Gemini, and Claude is decrypted, but only actual file-upload requests are inspected or blocked.
 
 The main implementation lives in `relay_proxy`. Supporting projects provide echo servers, HTTP clients, TLS test clients, and standalone TLS MITM proof-of-concept code.
 
@@ -12,10 +12,10 @@ The main implementation lives in `relay_proxy`. Supporting projects provide echo
 - Dynamic upstream resolution from HTTP `Host` headers
 - HTTP request and response parsing
 - HTTP `CONNECT` tunnel handling
-- Policy-based DLP inspection
-- Keyword, email, phone number, resident ID, credit card, file upload, and file extension detection
+- File-upload-only DLP inspection for selected AI websites
+- Dangerous file-extension and file-signature validation
 - Multipart/form-data upload parsing
-- Response body inspection before forwarding data to the client
+- Ordinary chat JSON, telemetry, response bodies, and personal information are not DLP-inspected
 - TLS MITM for selected HTTPS targets
 - Dynamic per-host leaf certificate generation and caching
 - Process-aware TLS intercept policy
@@ -66,6 +66,8 @@ Important modules include:
 - Visual Studio with C/C++ build tools
 - Windows SDK
 - OpenSSL for TLS MITM certificate generation and TLS handling
+- vcpkg packages `openssl:x64-windows`, `zlib:x64-windows`, and
+  `nghttp2:x64-windows` (`nghttp2` provides HPACK decoding for HTTP/2)
 - Winsock support through `Ws2_32.lib`
 - IP Helper API support through `Iphlpapi.lib`
 
@@ -76,6 +78,12 @@ Important modules include:
 3. Build the solution or build individual projects.
 4. Use `relay_proxy` as the main executable for HTTP/HTTPS proxy testing.
 
+Install the x64 native dependencies once if they are not already available:
+
+```powershell
+C:\vcpkg\vcpkg.exe install openssl:x64-windows zlib:x64-windows nghttp2:x64-windows
+```
+
 ## Default Ports
 
 | Component | Address |
@@ -84,30 +92,48 @@ Important modules include:
 | `echo_server` | `127.0.0.1:9000` |
 | Local TLS test server | `127.0.0.1:9443` |
 
-## Run Basic HTTP/DLP Test
+## File-only DLP behavior
 
-1. Build the solution in Visual Studio.
-2. Start `relay_proxy.exe`.
-3. Run `http_client.exe`.
-4. Modify the request body in the HTTP client to test different DLP rules.
+The proxy deliberately ignores ordinary request bodies, including chat JSON,
+telemetry, keywords, email addresses, phone numbers, resident IDs, and card-like
+numbers. DLP is entered only when both conditions are true:
 
-Example payloads:
+1. The destination is ChatGPT, Gemini, Claude, a local test host, or an exact
+   confirmed host in `upload_capture_hosts.txt`.
+2. The request is classified as a file upload from multipart metadata,
+   `Content-Disposition`, a file MIME type, or an upload-style PUT request.
+
+Safe text, Office, PDF, image, and ZIP files are allowed by the default policy.
+Executable and script extensions are blocked. A known file signature that does
+not match its declared extension is also blocked.
+
+At the default `INFO` log level, per-request HTTP headers, static assets,
+telemetry, Sentinel pings, TLS handshake details, session boundaries, and raw
+tunnel summaries are hidden. The normal upload trail is intentionally compact:
 
 ```text
-message=secret
-message=password
-message=confidential
-email=test@example.com
-phone=010-1234-5678
+UPLOAD PREPARED  ... original file name and redacted storage target
+UPLOAD INSPECTED ... hash, detected format, extracted text bytes, ALLOW/BLOCK
+UPLOAD FORWARDED ... upstream status for an allowed upload
 ```
 
-Expected behavior:
+Set `LOCAL_DLP_LOG_LEVEL=DEBUG` only while diagnosing protocol details. Signed
+upload URL query parameters are redacted at every log level.
 
-- `secret` is blocked.
-- `password` is blocked.
-- `confidential` is logged only.
-- Email-like content is blocked.
-- Phone-number-like content is blocked.
+ChatGPT metadata requests are correlated with the later raw PUT to
+`*.oaiusercontent.com`, even when they use different TCP/TLS sessions. DOCX
+containers, PDF content streams, and ZIP entries are inspected in memory. ZIP
+path traversal, encrypted entries, excessive expansion, dangerous embedded
+extensions, active/embedded PDF content, and declared-format signature
+mismatches are blocked. Extracted document text is counted for policy use but is
+not printed into the runtime log.
+
+An individual file can be checked without enabling the Windows proxy:
+
+```powershell
+.\x64\Release\relay_proxy.exe --analyze-file .\sample.docx `
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+```
 
 ## Run CONNECT Tunnel Test
 
@@ -186,26 +212,19 @@ Supported actions:
 | `BLOCK` | Block matching traffic and return a local block response |
 | `LOG_ONLY` | Allow traffic but write an audit event |
 
-Supported rule types:
+Supported rule types are intentionally limited to files:
 
 | Type | Description |
 | --- | --- |
-| `KEYWORD` | Match a specific keyword |
-| `EMAIL` | Detect email-like content |
-| `PHONE` | Detect phone-number-like content |
-| `RESIDENT_ID` | Detect resident-ID-like content |
-| `CREDIT_CARD` | Detect credit-card-like content |
 | `FILE_UPLOAD` | Detect multipart file uploads |
 | `FILE_EXT` | Match uploaded file extensions |
 
 Example:
 
 ```text
-1|BLOCK|KEYWORD|secret|Sensitive keyword detected: secret
-2|BLOCK|KEYWORD|password|Password keyword detected
-3|LOG_ONLY|KEYWORD|confidential|Confidential keyword detected. log only
-9|BLOCK|FILE_EXT|.zip|Zip file upload blocked
-10|LOG_ONLY|FILE_UPLOAD|-|File upload detected. log only
+1|BLOCK|FILE_EXT|.exe|Executable file upload blocked
+4|BLOCK|FILE_EXT|.bat|Batch script upload blocked
+10|LOG_ONLY|FILE_UPLOAD|-|File upload detected and allowed
 ```
 
 ## TLS Intercept Policy
@@ -228,7 +247,7 @@ Supported actions:
 
 | Action | Description |
 | --- | --- |
-| `MITM` | Decrypt HTTPS, inspect HTTP request/response data, and apply DLP rules |
+| `MITM` | Decrypt selected AI HTTPS traffic; DLP still runs only for file-upload requests |
 | `BYPASS` | Relay encrypted traffic without decryption |
 | `AUDIT` | Relay encrypted traffic and write explicit audit metadata |
 | `IGNORE` | Relay encrypted traffic while suppressing noisy tunnel logs |
@@ -237,14 +256,106 @@ Supported actions:
 Example:
 
 ```text
-demo.local:9443 MITM local_browser_test
-127.0.0.1:9443 MITM loopback_tls_test
-chrome.exe chatgpt.com:443 AUDIT chrome_ai_service_metadata_audit
-chrome.exe accounts.google.com:443 BYPASS auth_service_exception
-DEFAULT BYPASS safe_default_for_unknown_https
+chrome.exe demo.local:9443 MITM local_browser_test
+msedge.exe chatgpt.com:443 MITM ai_file_upload_only
+chrome.exe gemini.google.com:443 MITM ai_file_upload_only
+chrome.exe claude.ai:443 MITM ai_file_upload_only
+DEFAULT IGNORE non_ai_passthrough
 ```
 
 Rules are evaluated from top to bottom, and the first matching rule wins.
+The default profile is browser-only and AI-only. Non-AI websites, non-browser
+applications, authentication services, and unknown destinations use a silent
+raw TLS tunnel without content inspection.
+
+## Upload Host Discovery
+
+When a browser sends an upload to a host that is currently covered by the
+`IGNORE` default policy, enable metadata-only upload host discovery before
+starting the proxy:
+
+```powershell
+$env:LOCAL_DLP_DISCOVER_UPLOAD_HOSTS = "1"
+$env:LOCAL_DLP_DISCOVERY_MIN_UPLOAD_BYTES = "1024"
+..\x64\Debug\relay_proxy.exe
+```
+
+In another PowerShell window, watch only discovery events:
+
+```powershell
+Get-Content .\relay_runtime.log -Wait | Select-String "UPLOAD_HOST_"
+```
+
+Then open the target website in a supported browser and upload one test file.
+The proxy emits:
+
+- `UPLOAD_HOST_DISCOVERY_BEGIN` when an encrypted `IGNORE` tunnel starts.
+- `UPLOAD_HOST_CANDIDATE` when client-to-server traffic dominates a two-second
+  window and crosses the configured byte threshold.
+- `UPLOAD_HOST_DISCOVERY_SUMMARY` when the tunnel closes, including total
+  outbound/inbound bytes and the candidate result.
+
+Discovery does not decrypt or inspect the payload. It identifies candidates
+from encrypted byte direction and timing, so background POST requests can be
+false positives. Correlate the event time with the manual upload, then add only
+the confirmed browser/host pair to `relay_proxy/upload_capture_hosts.txt`:
+
+```text
+chrome.exe confirmed-upload.example.com:443
+```
+
+Restart the proxy after changing these environment variables,
+`upload_capture_hosts.txt`, or `tls_intercept_policy.txt`. The runtime `r`
+command reloads only `policy_rules.txt`.
+
+### Confirmed-host MITM and per-stream body capture
+
+After correlating an `UPLOAD_HOST_CANDIDATE` event with one controlled upload,
+add only that exact browser/host pair to:
+
+```text
+relay_proxy/upload_capture_hosts.txt
+```
+
+Rule format and example:
+
+```text
+<browser-process> <host>:<port>
+chrome.exe confirmed-upload.example.com:443
+```
+
+Then restart the proxy with body capture enabled:
+
+```powershell
+cd C:\Users\wodbs0101_global\source\repos\tcp_proxy_lab\relay_proxy
+
+$env:LOCAL_DLP_CAPTURE_UPLOAD_BODIES = "1"
+$env:LOCAL_DLP_CAPTURE_MAX_BYTES = "268435456"
+..\x64\Debug\relay_proxy.exe
+```
+
+A matching entry forces MITM on the next connection unless the normal TLS
+policy explicitly returns `BLOCK`. Decrypted request bodies are written to
+`relay_proxy/upload_captures`:
+
+- HTTP/2: one `.bin` file per HTTP/2 stream ID, written directly from DATA
+  frames up to the configured per-stream limit.
+- HTTP/1.1: one `.bin` file per request exchange. Chunked bodies are dechunked
+  when decoding succeeds.
+
+Watch capture decisions and output paths with:
+
+```powershell
+Get-Content .\relay_runtime.log -Wait |
+    Select-String "UPLOAD_CAPTURE_MITM_SELECTED|UPLOAD_BODY_CAPTURE_"
+```
+
+`UPLOAD_BODY_CAPTURE_BEGIN` includes the host, method, path, content type,
+stream ID, and output path. `UPLOAD_BODY_CAPTURE_END` reports bytes written,
+completion, truncation, and write status. Capture files contain decrypted raw
+request bodies and may include credentials, conversation data, multipart
+boundaries, or other sensitive information. Keep the allowlist exact, use only
+controlled test files, and remove the capture files after analysis.
 
 ## Runtime Policy Reload
 
@@ -255,6 +366,44 @@ r
 ```
 
 This reloads `policy_rules.txt` without restarting the proxy.
+
+## Windows TLS Trust and HTTP Protocol Mode
+
+For verified HTTPS interception, `relay_proxy` imports trusted roots from the
+Windows Current User and Local Machine `ROOT` stores into its OpenSSL client
+context. Public upstream certificates therefore remain verified without using
+`LOCAL_DLP_ALLOW_INSECURE_UPSTREAM`.
+
+HTTPS MITM follows ALPN negotiation. `http/1.1` uses the HTTP/1.1 parser while
+`h2` uses HPACK header decoding, per-stream request reconstruction, DLP policy
+evaluation, audit logging, upstream `RST_STREAM`, and a local HTTP/2 403 block
+response. HTTP/2 file request bodies are inspected up to 32 MiB per active
+stream. A file larger than the complete inspection buffer is blocked rather
+than receiving a partial safety decision.
+
+TLS itself is still normally TLS 1.2 or TLS 1.3. The HTTP application protocol
+is selected inside that handshake by ALPN: `http/1.1` selects the existing
+HTTP/1.1 engine and `h2` selects the HTTP/2 engine. At the default `INFO` level
+this protocol detail is hidden. Set `LOCAL_DLP_LOG_LEVEL=DEBUG` and confirm the
+choice with:
+
+```text
+TLS MITM ALPN selected. ... side=client alpn=h2
+TLS MITM ALPN selected. ... side=upstream alpn=h2
+TLS MITM HTTP/2 analysis and DLP enforcement started. ...
+HTTP2_ANALYSIS direction=REQUEST ... stream_id=...
+```
+
+For a real ChatGPT browser test, keep `chatgpt.com` and `*.openai.com` as `MITM`
+for the browser process in `tls_intercept_policy.txt`. The supplied policy does
+not decrypt `ChatGPT.exe`, Codex, WebView, or other desktop applications. Restart
+the proxy or press `r` after editing policy rules. Disable QUIC/HTTP/3 in the test
+browser so the request
+uses the configured TCP HTTP proxy; otherwise UDP/443 traffic does not pass
+through this proxy.
+
+Use `LOCAL_DLP_ALLOW_INSECURE_UPSTREAM=1` only for controlled local servers with
+self-signed certificates, never for public-site testing.
 
 ## Certificate Safety Notes
 

@@ -11,6 +11,7 @@
 #include <WinSock2.h>
 #include <WS2tcpip.h>
 #include <Windows.h>
+#include <Wincrypt.h>
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -29,10 +30,14 @@
 #include "content_decoder.h"
 #include "chunked_decoder.h"
 #include "http2_engine.h"
+#include "upload_capture.h"
+#include "upload_tracker.h"
+#include "file_analyzer.h"
 
 #pragma comment(lib, "Ws2_32.lib")
 #pragma comment(lib, "libssl.lib")
 #pragma comment(lib, "libcrypto.lib")
+#pragma comment(lib, "Crypt32.lib")
 
 #define TLS_MITM_CERT_FILE "certs\\mitm.crt"
 #define TLS_MITM_KEY_FILE  "certs\\mitm.key"
@@ -86,6 +91,59 @@ static void tls_mitm_log_openssl_error(const char* message)
     }
 }
 
+/*
+ * Browsers keep several speculative TLS connections open.  When the proxy is
+ * restarted those sockets can disappear between CONNECT and SSL_accept().
+ * OpenSSL reports that as an error even though it is only a client reconnect.
+ */
+static int tls_mitm_is_expected_client_handshake_close(
+    SSL* ssl,
+    int accept_result,
+    int* ssl_error_out,
+    int* socket_error_out
+)
+{
+    int ssl_error;
+    int socket_error;
+    unsigned long openssl_error;
+
+    ssl_error = SSL_get_error(ssl, accept_result);
+    socket_error = WSAGetLastError();
+    openssl_error = ERR_peek_error();
+
+    if (ssl_error_out != NULL) {
+        *ssl_error_out = ssl_error;
+    }
+    if (socket_error_out != NULL) {
+        *socket_error_out = socket_error;
+    }
+
+    if (ssl_error == SSL_ERROR_ZERO_RETURN) {
+        ERR_clear_error();
+        return 1;
+    }
+
+    if (ssl_error == SSL_ERROR_SYSCALL &&
+        (openssl_error == 0 ||
+            socket_error == WSAECONNRESET ||
+            socket_error == WSAECONNABORTED ||
+            socket_error == WSAENOTCONN)) {
+        ERR_clear_error();
+        return 1;
+    }
+
+#ifdef SSL_R_UNEXPECTED_EOF_WHILE_READING
+    if (ssl_error == SSL_ERROR_SSL &&
+        openssl_error != 0 &&
+        ERR_GET_REASON(openssl_error) == SSL_R_UNEXPECTED_EOF_WHILE_READING) {
+        ERR_clear_error();
+        return 1;
+    }
+#endif
+
+    return 0;
+}
+
 static int tls_mitm_env_flag_enabled(const char* name)
 {
     char value[16];
@@ -105,6 +163,100 @@ static int tls_mitm_env_flag_enabled(const char* name)
         _stricmp(value, "true") == 0 ||
         _stricmp(value, "yes") == 0 ||
         _stricmp(value, "on") == 0;
+}
+
+static int tls_mitm_add_windows_store_to_openssl(
+    X509_STORE* openssl_store,
+    DWORD store_location,
+    const char* location_name
+)
+{
+    HCERTSTORE windows_store;
+    PCCERT_CONTEXT cert_context = NULL;
+    int added = 0;
+
+    if (openssl_store == NULL) {
+        return 0;
+    }
+
+    windows_store = CertOpenStore(
+        CERT_STORE_PROV_SYSTEM_A,
+        0,
+        0,
+        store_location | CERT_STORE_READONLY_FLAG,
+        "ROOT"
+    );
+    if (windows_store == NULL) {
+        log_warn(
+            "failed to open Windows ROOT certificate store. location=%s win32_error=%lu",
+            location_name != NULL ? location_name : "-",
+            (unsigned long)GetLastError()
+        );
+        return 0;
+    }
+
+    while ((cert_context = CertEnumCertificatesInStore(windows_store, cert_context)) != NULL) {
+        const unsigned char* encoded = cert_context->pbCertEncoded;
+        X509* certificate = d2i_X509(NULL, &encoded, (long)cert_context->cbCertEncoded);
+
+        if (certificate == NULL) {
+            ERR_clear_error();
+            continue;
+        }
+
+        if (X509_STORE_add_cert(openssl_store, certificate) != 1) {
+            /* Duplicate roots are expected across OpenSSL and Windows stores. */
+            ERR_clear_error();
+        }
+
+        /* Parsed certificates count as available even when already present. */
+        added++;
+
+        X509_free(certificate);
+    }
+
+    CertCloseStore(windows_store, 0);
+    return added;
+}
+
+static int tls_mitm_load_windows_trust_roots(SSL_CTX* ctx)
+{
+    X509_STORE* store;
+    int current_user_count;
+    int local_machine_count;
+
+    if (ctx == NULL) {
+        return -1;
+    }
+
+    store = SSL_CTX_get_cert_store(ctx);
+    if (store == NULL) {
+        log_error("TLS MITM failed to get OpenSSL certificate store");
+        return -1;
+    }
+
+    current_user_count = tls_mitm_add_windows_store_to_openssl(
+        store,
+        CERT_SYSTEM_STORE_CURRENT_USER,
+        "CurrentUser"
+    );
+    local_machine_count = tls_mitm_add_windows_store_to_openssl(
+        store,
+        CERT_SYSTEM_STORE_LOCAL_MACHINE,
+        "LocalMachine"
+    );
+
+    if (current_user_count + local_machine_count <= 0) {
+        log_error("TLS MITM did not load any Windows trusted root certificates");
+        return -1;
+    }
+
+    log_debug(
+        "TLS MITM Windows trust roots loaded. current_user=%d local_machine=%d",
+        current_user_count,
+        local_machine_count
+    );
+    return 0;
 }
 
 
@@ -454,10 +606,8 @@ static SSL_CTX* tls_mitm_create_server_ctx(void)
     }
 
     /*
-        Browser test mode:
-        Modern browsers may offer h2 and http/1.1 through ALPN.
-        Prefer h2 when the client offers it, otherwise use HTTP/1.1.
-        HTTP/2 is inspected at the frame/DATA level; HTTP/1.1 keeps the existing parser path.
+        Select the best protocol offered by the browser. HTTP/1.1 uses the
+        existing request parser and HTTP/2 uses the HPACK/stream DLP engine.
     */
     SSL_CTX_set_alpn_select_cb(ctx, tls_mitm_alpn_select_supported_cb, NULL);
 
@@ -486,8 +636,13 @@ static SSL_CTX* tls_mitm_create_client_ctx(void)
     else {
         SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
 
+        /* OpenSSL on Windows does not automatically use the Windows trust stores. */
         if (SSL_CTX_set_default_verify_paths(ctx) != 1) {
-            tls_mitm_log_openssl_error("SSL_CTX_set_default_verify_paths() failed");
+            ERR_clear_error();
+            log_debug("OpenSSL default verify paths are unavailable; using Windows trust stores");
+        }
+
+        if (tls_mitm_load_windows_trust_roots(ctx) != 0) {
             SSL_CTX_free(ctx);
             return NULL;
         }
@@ -964,6 +1119,13 @@ static int tls_mitm_process_one_http_request_response(
     http_request_t request;
     http_response_t response;
     dlp_result_t dlp_result;
+    unsigned long metadata_upload_id = 0;
+    upload_tracking_info_t upload_info;
+    file_analysis_result_t file_analysis;
+    int file_analysis_complete = 0;
+
+    memset(&upload_info, 0, sizeof(upload_info));
+    memset(&file_analysis, 0, sizeof(file_analysis));
 
     request_buffer = (request_buffer_t*)malloc(sizeof(request_buffer_t));
     response_buffer = (response_buffer_t*)malloc(sizeof(response_buffer_t));
@@ -1014,17 +1176,23 @@ static int tls_mitm_process_one_http_request_response(
         goto cleanup;
     }
 
-    log_info(
-        "TLS MITM decrypted HTTP request. session_id=%lu exchange_index=%d length=%d method=%s path=%s host=%s",
-        session->session_id,
-        exchange_index,
-        complete_request_length,
-        request.method,
-        request.path,
-        request.host
-    );
+    {
+        char sanitized_path[UPLOAD_TRACKER_PATH_SIZE];
+        upload_tracker_sanitize_path(request.path, sanitized_path, sizeof(sanitized_path));
+        log_info(
+            "TLS MITM decrypted HTTP request. session_id=%lu exchange_index=%d length=%d method=%s path=%s host=%s",
+            session->session_id,
+            exchange_index,
+            complete_request_length,
+            request.method,
+            sanitized_path,
+            request.host
+        );
+    }
 
-    print_http_request(&request);
+    if (logger_is_debug_enabled()) {
+        print_http_request(&request);
+    }
     log_http_request_analysis(&request, session->session_id, "HTTPS_MITM");
 
     {
@@ -1059,8 +1227,120 @@ static int tls_mitm_process_one_http_request_response(
             );
         }
 
+        if (request.body_data != NULL && request.body_data_length > 0) {
+            upload_capture_writer_t capture;
+            const void* capture_body = request.body_data;
+            size_t capture_body_length = (size_t)request.body_data_length;
+            unsigned char* decoded_capture_body = NULL;
+            int decoded_capture_body_length = 0;
+
+            memset(&capture, 0, sizeof(capture));
+
+            if (chunked_decode_result == 1 &&
+                chunked_decode_http_message_body(
+                    request_data,
+                    complete_request_length,
+                    &decoded_capture_body,
+                    &decoded_capture_body_length
+                ) == 0) {
+                capture_body = decoded_capture_body;
+                capture_body_length = (size_t)decoded_capture_body_length;
+            }
+
+            if (upload_capture_begin(
+                &capture,
+                session,
+                &request,
+                443,
+                "http1",
+                (unsigned int)exchange_index
+            ) > 0) {
+                upload_capture_append(&capture, capture_body, capture_body_length);
+                upload_capture_finish(&capture, 1);
+            }
+
+            free(decoded_capture_body);
+        }
+
         dlp_result = inspect_dlp_request(request_for_dlp);
-        inspect_multipart_upload_request(request_for_dlp, &dlp_result);
+        if (dlp_request_should_inspect(request_for_dlp)) {
+            inspect_multipart_upload_request(request_for_dlp, &dlp_result);
+        }
+
+        if (upload_tracker_is_metadata_request(
+            request_for_dlp->method,
+            request_for_dlp->host,
+            request_for_dlp->path
+        )) {
+            const char* metadata_body = request_for_dlp->body_data != NULL
+                ? request_for_dlp->body_data : request_for_dlp->body;
+            size_t metadata_body_length = request_for_dlp->body_data != NULL
+                ? (size_t)request_for_dlp->body_data_length : (size_t)request_for_dlp->body_length;
+            metadata_upload_id = upload_tracker_record_metadata_request(
+                session->session_id,
+                (unsigned int)exchange_index,
+                metadata_body,
+                metadata_body_length
+            );
+        }
+
+        if (dlp_request_should_inspect(request_for_dlp) &&
+            strstr(request_for_dlp->content_type, "multipart/form-data") == NULL) {
+            const unsigned char* file_body = (const unsigned char*)(request_for_dlp->body_data != NULL
+                ? request_for_dlp->body_data : request_for_dlp->body);
+            size_t file_body_length = request_for_dlp->body_data != NULL
+                ? (size_t)request_for_dlp->body_data_length : (size_t)request_for_dlp->body_length;
+            char sanitized_path[UPLOAD_TRACKER_PATH_SIZE];
+            const char* filename;
+
+            upload_tracker_match_raw_put(
+                request_for_dlp->host,
+                request_for_dlp->path,
+                request_for_dlp->content_type,
+                request_for_dlp->content_length > 0
+                    ? (unsigned long long)request_for_dlp->content_length
+                    : (unsigned long long)file_body_length,
+                &upload_info
+            );
+            filename = upload_info.filename[0] ? upload_info.filename : "unknown";
+            if (file_analyzer_inspect(
+                filename,
+                request_for_dlp->content_type,
+                file_body,
+                file_body_length,
+                &file_analysis
+            ) != 0) {
+                memset(&file_analysis, 0, sizeof(file_analysis));
+                file_analysis.action = FILE_ANALYSIS_BLOCK;
+                strcpy_s(file_analysis.format, sizeof(file_analysis.format), "UNKNOWN");
+                strcpy_s(file_analysis.reason, sizeof(file_analysis.reason), "file analyzer failed");
+            }
+            file_analysis_complete = 1;
+            if (file_analysis.action == FILE_ANALYSIS_BLOCK) {
+                dlp_result.action = DLP_ACTION_BLOCK;
+                dlp_result.matched_rule_id = 9001;
+                strncpy_s(dlp_result.keyword, sizeof(dlp_result.keyword), file_analysis.format, _TRUNCATE);
+                strncpy_s(dlp_result.reason, sizeof(dlp_result.reason), file_analysis.reason, _TRUNCATE);
+            }
+            upload_tracker_sanitize_path(request_for_dlp->path, sanitized_path, sizeof(sanitized_path));
+            log_info(
+                "UPLOAD INSPECTED id=%lu session=%lu exchange=%d file=\"%s\" bytes=%llu type=%s format=%s entries=%u extracted_text_bytes=%llu sha256=%s action=%s reason=\"%s\" target=%s%s",
+                upload_info.upload_id,
+                session->session_id,
+                exchange_index,
+                filename,
+                (unsigned long long)file_body_length,
+                request_for_dlp->content_type[0] ? request_for_dlp->content_type : "unknown",
+                file_analysis.format[0] ? file_analysis.format : "UNKNOWN",
+                file_analysis.archive_entries,
+                file_analysis.extracted_text_bytes,
+                file_analysis.sha256[0] ? file_analysis.sha256 : "unavailable",
+                file_analysis.action == FILE_ANALYSIS_BLOCK ? "BLOCK" : "ALLOW",
+                file_analysis.reason[0] ? file_analysis.reason : "-",
+                request_for_dlp->host[0] ? request_for_dlp->host : "-",
+                sanitized_path
+            );
+        }
 
     if (dlp_result.action == DLP_ACTION_BLOCK) {
         log_security(
@@ -1164,7 +1444,9 @@ static int tls_mitm_process_one_http_request_response(
             response.content_type[0] != '\0' ? response.content_type : "-"
         );
 
-        print_http_response(&response);
+        if (logger_is_debug_enabled()) {
+            print_http_response(&response);
+        }
         log_http_response_analysis(&response, session->session_id, "HTTPS_MITM");
 
         if (response.status_code >= 100 && response.status_code < 200 && response.status_code != 101) {
@@ -1275,6 +1557,25 @@ static int tls_mitm_process_one_http_request_response(
 
             audit_log_response_log_only_event(session, response_for_dlp, &dlp_result);
         }
+    }
+
+    if (metadata_upload_id != 0 && response.body_length > 0) {
+        upload_tracker_record_metadata_response(
+            metadata_upload_id,
+            response.body,
+            (size_t)response.body_length
+        );
+    }
+
+    if (file_analysis_complete) {
+        log_info(
+            "UPLOAD FORWARDED id=%lu session=%lu exchange=%d file=\"%s\" upstream_status=%d",
+            upload_info.upload_id,
+            session->session_id,
+            exchange_index,
+            upload_info.filename[0] ? upload_info.filename : "unknown",
+            response.status_code
+        );
     }
 
     if (ssl_write_all(client_ssl, response_data, complete_response_length) < 0) {
@@ -1431,9 +1732,41 @@ int tls_mitm_handle_connect_session(
         goto cleanup;
     }
 
-    if (SSL_accept(client_ssl) != 1) {
-        tls_mitm_log_openssl_error("SSL_accept() from client failed");
-        goto cleanup;
+    {
+        int accept_result;
+
+        accept_result = SSL_accept(client_ssl);
+        if (accept_result != 1) {
+            int ssl_error = 0;
+            int socket_error = 0;
+
+            if (tls_mitm_is_expected_client_handshake_close(
+                client_ssl,
+                accept_result,
+                &ssl_error,
+                &socket_error
+            )) {
+                log_debug(
+                    "TLS client disconnected during handshake; browser may reconnect. session_id=%lu host=%s ssl_error=%d socket_error=%d",
+                    session->session_id,
+                    connect_host[0] != '\0' ? connect_host : "-",
+                    ssl_error,
+                    socket_error
+                );
+                result = 0;
+                goto cleanup;
+            }
+
+            log_error(
+                "SSL_accept() from client failed. session_id=%lu host=%s ssl_error=%d socket_error=%d",
+                session->session_id,
+                connect_host[0] != '\0' ? connect_host : "-",
+                ssl_error,
+                socket_error
+            );
+            tls_mitm_log_openssl_error("OpenSSL client handshake detail");
+            goto cleanup;
+        }
     }
 
     log_info(
@@ -1556,6 +1889,14 @@ int tls_mitm_handle_connect_session(
     }
 
     if (SSL_connect(upstream_ssl) != 1) {
+        long verify_result = SSL_get_verify_result(upstream_ssl);
+        log_error(
+            "TLS MITM upstream handshake failed. session_id=%lu host=%s verify_result=%ld verify_error=\"%s\"",
+            session->session_id,
+            upstream_sni[0] != '\0' ? upstream_sni : connect_host,
+            verify_result,
+            X509_verify_cert_error_string(verify_result)
+        );
         tls_mitm_log_openssl_error("SSL_connect() to upstream failed");
         goto cleanup;
     }
@@ -1596,6 +1937,13 @@ int tls_mitm_handle_connect_session(
     );
 
     tls_mitm_log_selected_alpn(session, upstream_ssl, "upstream");
+
+    log_info(
+        "AI TLS READY session=%lu host=%s protocol=%s",
+        session->session_id,
+        upstream_sni[0] != '\0' ? upstream_sni : connect_host,
+        app_protocol == TLS_MITM_APP_PROTOCOL_HTTP2 ? "h2" : "http/1.1"
+    );
 
     if (app_protocol == TLS_MITM_APP_PROTOCOL_HTTP2 &&
         tls_mitm_get_selected_app_protocol(upstream_ssl) == TLS_MITM_APP_PROTOCOL_HTTP2) {

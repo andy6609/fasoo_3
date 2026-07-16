@@ -20,13 +20,8 @@
 #define POLICY_LINE_SIZE 1024
 
 typedef enum {
-    POLICY_RULE_TYPE_KEYWORD = 0,
-    POLICY_RULE_TYPE_EMAIL = 1,
-    POLICY_RULE_TYPE_PHONE = 2,
-    POLICY_RULE_TYPE_RESIDENT_ID = 3,
-    POLICY_RULE_TYPE_CREDIT_CARD = 4,
-    POLICY_RULE_TYPE_FILE_UPLOAD = 5,
-    POLICY_RULE_TYPE_FILE_EXT = 6
+    POLICY_RULE_TYPE_FILE_UPLOAD = 0,
+    POLICY_RULE_TYPE_FILE_EXT = 1
 } policy_rule_type_t;
 
 typedef struct {
@@ -129,21 +124,6 @@ static const char* policy_action_to_string(policy_action_t action)
 static const char* policy_rule_type_to_string(policy_rule_type_t type)
 {
     switch (type) {
-    case POLICY_RULE_TYPE_KEYWORD:
-        return "KEYWORD";
-
-    case POLICY_RULE_TYPE_EMAIL:
-        return "EMAIL";
-
-    case POLICY_RULE_TYPE_PHONE:
-        return "PHONE";
-
-    case POLICY_RULE_TYPE_RESIDENT_ID:
-        return "RESIDENT_ID";
-
-    case POLICY_RULE_TYPE_CREDIT_CARD:
-        return "CREDIT_CARD";
-
     case POLICY_RULE_TYPE_FILE_UPLOAD:
         return "FILE_UPLOAD";
 
@@ -188,31 +168,6 @@ static int parse_policy_rule_type(
         return -1;
     }
 
-    if (_stricmp(type_text, "KEYWORD") == 0) {
-        *type = POLICY_RULE_TYPE_KEYWORD;
-        return 0;
-    }
-
-    if (_stricmp(type_text, "EMAIL") == 0) {
-        *type = POLICY_RULE_TYPE_EMAIL;
-        return 0;
-    }
-
-    if (_stricmp(type_text, "PHONE") == 0) {
-        *type = POLICY_RULE_TYPE_PHONE;
-        return 0;
-    }
-
-    if (_stricmp(type_text, "RESIDENT_ID") == 0) {
-        *type = POLICY_RULE_TYPE_RESIDENT_ID;
-        return 0;
-    }
-
-    if (_stricmp(type_text, "CREDIT_CARD") == 0) {
-        *type = POLICY_RULE_TYPE_CREDIT_CARD;
-        return 0;
-    }
-
     if (_stricmp(type_text, "FILE_UPLOAD") == 0) {
         *type = POLICY_RULE_TYPE_FILE_UPLOAD;
         return 0;
@@ -244,7 +199,7 @@ static int add_policy_rule_no_lock(
         return -1;
     }
 
-    if (type == POLICY_RULE_TYPE_KEYWORD || type == POLICY_RULE_TYPE_FILE_EXT) {
+    if (type == POLICY_RULE_TYPE_FILE_EXT) {
         if (pattern == NULL || pattern[0] == '\0' || strcmp(pattern, "-") == 0) {
             return -1;
         }
@@ -281,33 +236,24 @@ static void load_default_policy_rules_no_lock(void)
 {
     clear_policy_rules_no_lock();
 
-    add_policy_rule_no_lock(1, POLICY_ACTION_BLOCK, POLICY_RULE_TYPE_KEYWORD,
-        "secret", "Sensitive keyword detected: secret");
-
-    add_policy_rule_no_lock(2, POLICY_ACTION_BLOCK, POLICY_RULE_TYPE_KEYWORD,
-        "password", "Password keyword detected");
-
-    add_policy_rule_no_lock(3, POLICY_ACTION_LOG_ONLY, POLICY_RULE_TYPE_KEYWORD,
-        "confidential", "Confidential keyword detected. log only");
-
-    add_policy_rule_no_lock(4, POLICY_ACTION_BLOCK, POLICY_RULE_TYPE_EMAIL,
-        "-", "Email address detected");
-
-    add_policy_rule_no_lock(5, POLICY_ACTION_BLOCK, POLICY_RULE_TYPE_PHONE,
-        "-", "Phone number detected");
-
-    add_policy_rule_no_lock(6, POLICY_ACTION_BLOCK, POLICY_RULE_TYPE_RESIDENT_ID,
-        "-", "Resident ID pattern detected");
-
-    add_policy_rule_no_lock(7, POLICY_ACTION_BLOCK, POLICY_RULE_TYPE_CREDIT_CARD,
-        "-", "Credit card pattern detected");
-
+    add_policy_rule_no_lock(1, POLICY_ACTION_BLOCK, POLICY_RULE_TYPE_FILE_EXT,
+        ".exe", "Executable file upload blocked");
+    add_policy_rule_no_lock(2, POLICY_ACTION_BLOCK, POLICY_RULE_TYPE_FILE_EXT,
+        ".dll", "DLL file upload blocked");
+    add_policy_rule_no_lock(3, POLICY_ACTION_BLOCK, POLICY_RULE_TYPE_FILE_EXT,
+        ".msi", "Installer file upload blocked");
+    add_policy_rule_no_lock(4, POLICY_ACTION_BLOCK, POLICY_RULE_TYPE_FILE_EXT,
+        ".bat", "Batch script upload blocked");
+    add_policy_rule_no_lock(5, POLICY_ACTION_BLOCK, POLICY_RULE_TYPE_FILE_EXT,
+        ".cmd", "Command script upload blocked");
+    add_policy_rule_no_lock(6, POLICY_ACTION_BLOCK, POLICY_RULE_TYPE_FILE_EXT,
+        ".ps1", "PowerShell script upload blocked");
+    add_policy_rule_no_lock(7, POLICY_ACTION_BLOCK, POLICY_RULE_TYPE_FILE_EXT,
+        ".vbs", "VBScript upload blocked");
     add_policy_rule_no_lock(8, POLICY_ACTION_BLOCK, POLICY_RULE_TYPE_FILE_EXT,
-        ".xlsx", "Excel file upload blocked");
-
+        ".scr", "Screen saver executable upload blocked");
     add_policy_rule_no_lock(9, POLICY_ACTION_BLOCK, POLICY_RULE_TYPE_FILE_EXT,
-        ".zip", "Zip file upload blocked");
-
+        ".com", "Executable command upload blocked");
     add_policy_rule_no_lock(10, POLICY_ACTION_LOG_ONLY, POLICY_RULE_TYPE_FILE_UPLOAD,
         "-", "File upload detected. log only");
 
@@ -381,7 +327,7 @@ static int parse_policy_line_no_lock(char* line, int line_number)
         return -1;
     }
 
-    log_info(
+    log_debug(
         "policy rule loaded. rule_id=%d action=%s type=%s pattern=%s",
         rule_id,
         policy_action_to_string(action),
@@ -500,8 +446,7 @@ static policy_result_t make_policy_match_result(const policy_rule_t* rule)
     result.action = rule->action;
     result.matched_rule_id = rule->rule_id;
 
-    if (rule->type == POLICY_RULE_TYPE_KEYWORD ||
-        rule->type == POLICY_RULE_TYPE_FILE_EXT) {
+    if (rule->type == POLICY_RULE_TYPE_FILE_EXT) {
         strncpy_s(result.keyword, sizeof(result.keyword), rule->pattern, _TRUNCATE);
     }
     else {
@@ -561,21 +506,6 @@ static int policy_rule_matches(
     }
 
     switch (rule->type) {
-    case POLICY_RULE_TYPE_KEYWORD:
-        return contains_keyword_ignore_case(data, length, rule->pattern);
-
-    case POLICY_RULE_TYPE_EMAIL:
-        return detect_email_pattern(data, length);
-
-    case POLICY_RULE_TYPE_PHONE:
-        return detect_phone_pattern(data, length);
-
-    case POLICY_RULE_TYPE_RESIDENT_ID:
-        return detect_resident_id_pattern(data, length);
-
-    case POLICY_RULE_TYPE_CREDIT_CARD:
-        return detect_credit_card_pattern(data, length);
-
     case POLICY_RULE_TYPE_FILE_UPLOAD:
         return detect_file_upload_pattern(data, length);
 

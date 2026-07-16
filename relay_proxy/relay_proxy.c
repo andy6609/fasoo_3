@@ -33,16 +33,66 @@
 #include "multipart_parser.h"
 #include "content_decoder.h"
 #include "chunked_decoder.h"
+#include "upload_capture.h"
+#include "upload_tracker.h"
+#include "file_analyzer.h"
 
 #pragma comment(lib, "Ws2_32.lib")
 
 #define PROXY_PORT 8000
 #define POLICY_FILE_PATH "policy_rules.txt"
 #define TLS_INTERCEPT_POLICY_FILE_PATH "tls_intercept_policy.txt"
+#define UPLOAD_CAPTURE_HOSTS_FILE_PATH "upload_capture_hosts.txt"
 
 #define BUFFER_SIZE 4096
 #define SELECT_TIMEOUT_SEC 300
 #define ENABLE_TLS_MITM 1
+#define UPLOAD_HOST_DISCOVERY_ENV "LOCAL_DLP_DISCOVER_UPLOAD_HOSTS"
+#define UPLOAD_HOST_DISCOVERY_MIN_BYTES_ENV "LOCAL_DLP_DISCOVERY_MIN_UPLOAD_BYTES"
+#define UPLOAD_HOST_DISCOVERY_DEFAULT_MIN_BYTES 4096ULL
+#define UPLOAD_HOST_DISCOVERY_WINDOW_MS 2000ULL
+
+static int environment_flag_enabled(const char* name)
+{
+    const char* value;
+
+    if (name == NULL || name[0] == '\0') {
+        return 0;
+    }
+
+    value = getenv(name);
+    if (value == NULL || value[0] == '\0') {
+        return 0;
+    }
+
+    return _stricmp(value, "1") == 0 ||
+           _stricmp(value, "true") == 0 ||
+           _stricmp(value, "yes") == 0 ||
+           _stricmp(value, "on") == 0;
+}
+
+static unsigned long long upload_host_discovery_min_bytes(void)
+{
+    const char* value = getenv(UPLOAD_HOST_DISCOVERY_MIN_BYTES_ENV);
+    char* end = NULL;
+    unsigned __int64 parsed;
+
+    if (value == NULL || value[0] == '\0') {
+        return UPLOAD_HOST_DISCOVERY_DEFAULT_MIN_BYTES;
+    }
+
+    parsed = _strtoui64(value, &end, 10);
+    if (end == value || end == NULL || *end != '\0') {
+        return UPLOAD_HOST_DISCOVERY_DEFAULT_MIN_BYTES;
+    }
+
+    return (unsigned long long)parsed;
+}
+
+static int upload_host_discovery_enabled(void)
+{
+    return environment_flag_enabled(UPLOAD_HOST_DISCOVERY_ENV);
+}
 
 static int is_same_endpoint(
     const char* ip1,
@@ -132,6 +182,78 @@ static int is_connect_request(const http_request_t* request)
     return _stricmp(request->method, "CONNECT") == 0;
 }
 
+static int is_web_browser_process(const process_metadata_t* metadata)
+{
+    static const char* browser_names[] = {
+        "chrome.exe",
+        "msedge.exe",
+        "firefox.exe",
+        "brave.exe",
+        "opera.exe",
+        "opera_gx.exe",
+        "vivaldi.exe"
+    };
+    size_t i;
+
+    if (metadata == NULL || !metadata->found || metadata->process_name[0] == '\0') {
+        return 0;
+    }
+
+    for (i = 0; i < sizeof(browser_names) / sizeof(browser_names[0]); i++) {
+        if (_stricmp(metadata->process_name, browser_names[i]) == 0) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static int apply_upload_capture_mitm_override(
+    const proxy_session_context_t* session,
+    const upstream_target_t* target,
+    tls_intercept_decision_t* decision
+)
+{
+    const char* process_name;
+
+    if (session == NULL || target == NULL || decision == NULL ||
+        decision->action == TLS_INTERCEPT_ACTION_BLOCK) {
+        return 0;
+    }
+
+    process_name = session->process.process_name[0] != '\0'
+        ? session->process.process_name : "-";
+    if (!upload_capture_host_matches(process_name, target->host, target->port)) {
+        return 0;
+    }
+
+    decision->action = TLS_INTERCEPT_ACTION_MITM;
+    decision->matched = 1;
+    decision->matched_default = 0;
+    decision->rule_port = target->port;
+    _snprintf_s(
+        decision->rule_process,
+        sizeof(decision->rule_process),
+        _TRUNCATE,
+        "%s",
+        process_name
+    );
+    _snprintf_s(
+        decision->rule_host,
+        sizeof(decision->rule_host),
+        _TRUNCATE,
+        "%s",
+        target->host
+    );
+    _snprintf_s(
+        decision->reason,
+        sizeof(decision->reason),
+        _TRUNCATE,
+        "confirmed_upload_capture_host"
+    );
+    return 1;
+}
+
 static int should_suppress_connect_policy_logs(
     proxy_session_context_t* session,
     const http_request_t* request
@@ -163,6 +285,7 @@ static int should_suppress_connect_policy_logs(
         session->process.process_name,
         &decision
     );
+    apply_upload_capture_mitm_override(session, &target, &decision);
 
     return decision.action == TLS_INTERCEPT_ACTION_IGNORE;
 #else
@@ -201,6 +324,62 @@ static const char* safe_log_string(const char* value)
     return value;
 }
 
+static void log_upload_host_discovery_summary(
+    const proxy_session_context_t* session,
+    const char* target_host,
+    int target_port,
+    unsigned long long min_upload_bytes,
+    unsigned long long bytes_client_to_upstream,
+    unsigned long long bytes_upstream_to_client,
+    unsigned long long duration_ms,
+    const char* finish_reason,
+    int result,
+    int burst_candidate_detected
+)
+{
+    int total_outbound_candidate;
+    int candidate;
+    const char* signal;
+
+    if (session == NULL) {
+        return;
+    }
+
+    total_outbound_candidate =
+        bytes_client_to_upstream >= min_upload_bytes &&
+        bytes_client_to_upstream > bytes_upstream_to_client;
+    candidate = burst_candidate_detected || total_outbound_candidate;
+
+    if (burst_candidate_detected) {
+        signal = "outbound_burst";
+    }
+    else if (total_outbound_candidate) {
+        signal = "outbound_total";
+    }
+    else if (bytes_client_to_upstream < min_upload_bytes) {
+        signal = "below_threshold";
+    }
+    else {
+        signal = "inbound_dominant_or_balanced";
+    }
+
+    log_info(
+        "UPLOAD_HOST_DISCOVERY_SUMMARY session_id=%lu process=%s target=%s:%d candidate=%s signal=%s outbound_bytes=%llu inbound_bytes=%llu min_upload_bytes=%llu duration_ms=%llu result=%s finish_reason=%s mode=encrypted_metadata_only payload_decrypted=false",
+        session->session_id,
+        session->process.process_name[0] != '\0' ? session->process.process_name : "-",
+        safe_log_string(target_host),
+        target_port,
+        candidate ? "YES" : "NO",
+        signal,
+        bytes_client_to_upstream,
+        bytes_upstream_to_client,
+        min_upload_bytes,
+        duration_ms,
+        result == 0 ? "OK" : "ERROR",
+        safe_log_string(finish_reason)
+    );
+}
+
 static void log_raw_tunnel_summary(
     const proxy_session_context_t* session,
     const char* target_host,
@@ -220,7 +399,7 @@ static void log_raw_tunnel_summary(
         return;
     }
 
-    log_info(
+    log_debug(
         "CONNECT raw tunnel summary. session_id=%lu process=%s target=%s:%d policy_action=%s result=%s finish_reason=%s duration_ms=%llu client_to_upstream_bytes=%llu upstream_to_client_bytes=%llu client_to_upstream_chunks=%llu upstream_to_client_chunks=%llu",
         session->session_id,
         session->process.process_name[0] != '\0' ? session->process.process_name : "-",
@@ -236,7 +415,7 @@ static void log_raw_tunnel_summary(
         chunk_count_upstream_to_client
     );
 
-    log_security(
+    log_debug(
         "AUDIT session_id=%lu direction=CONNECT action=RAW_TUNNEL_SUMMARY process_id=%lu process_name=%s process_path=\"%s\" target=%s:%d upstream=%s:%d policy_action=%s reason=\"%s\" result=%s finish_reason=%s duration_ms=%llu bytes_client_to_upstream=%llu bytes_upstream_to_client=%llu chunks_client_to_upstream=%llu chunks_upstream_to_client=%llu",
         session->session_id,
         (unsigned long)session->process.process_id,
@@ -274,9 +453,16 @@ static int raw_tunnel_loop(
     unsigned long long bytes_upstream_to_client = 0;
     unsigned long long chunk_count_client_to_upstream = 0;
     unsigned long long chunk_count_upstream_to_client = 0;
+    unsigned long long discovery_window_client_bytes = 0;
+    unsigned long long discovery_window_upstream_bytes = 0;
+    unsigned long long discovery_min_upload_bytes = 0;
     ULONGLONG started_ms;
     ULONGLONG finished_ms;
+    ULONGLONG discovery_window_started_ms;
     const char* finish_reason = "unknown";
+    int upload_discovery_active = 0;
+    int upload_candidate_logged = 0;
+    int discovery_upstream_data_observed = 0;
     int result = 0;
 
     if (session == NULL || upstream_sock == INVALID_SOCKET) {
@@ -285,9 +471,29 @@ static int raw_tunnel_loop(
 
     client_sock = session->client_sock;
     started_ms = GetTickCount64();
+    discovery_window_started_ms = started_ms;
+
+    upload_discovery_active =
+        suppress_tunnel_logs &&
+        policy_action != NULL &&
+        _stricmp(policy_action, "IGNORE") == 0 &&
+        upload_host_discovery_enabled();
+
+    if (upload_discovery_active) {
+        discovery_min_upload_bytes = upload_host_discovery_min_bytes();
+        log_info(
+            "UPLOAD_HOST_DISCOVERY_BEGIN session_id=%lu process=%s target=%s:%d min_upload_bytes=%llu window_ms=%llu mode=encrypted_metadata_only payload_decrypted=false",
+            session->session_id,
+            session->process.process_name[0] != '\0' ? session->process.process_name : "-",
+            safe_log_string(target_host),
+            target_port,
+            discovery_min_upload_bytes,
+            (unsigned long long)UPLOAD_HOST_DISCOVERY_WINDOW_MS
+        );
+    }
 
     if (!suppress_tunnel_logs) {
-        log_info(
+        log_debug(
             "CONNECT raw tunnel loop started. session_id=%lu process=%s target=%s:%d policy_action=%s client=%s:%d upstream=%s:%d",
             session->session_id,
             session->process.process_name[0] != '\0' ? session->process.process_name : "-",
@@ -343,6 +549,17 @@ static int raw_tunnel_loop(
             int recv_len = recv(client_sock, tunnel_buffer, BUFFER_SIZE, 0);
 
             if (recv_len > 0) {
+                if (upload_discovery_active) {
+                    ULONGLONG now_ms = GetTickCount64();
+
+                    if (now_ms - discovery_window_started_ms > UPLOAD_HOST_DISCOVERY_WINDOW_MS) {
+                        discovery_window_started_ms = now_ms;
+                        discovery_window_client_bytes = 0;
+                        discovery_window_upstream_bytes = 0;
+                    }
+                    discovery_window_client_bytes += (unsigned long long)recv_len;
+                }
+
                 session_context_add_bytes_from_client(session, recv_len);
 
                 if (send_all(upstream_sock, tunnel_buffer, recv_len) == SOCKET_ERROR) {
@@ -370,7 +587,7 @@ static int raw_tunnel_loop(
             }
             else if (recv_len == 0) {
                 if (!suppress_tunnel_logs) {
-                    log_info(
+                    log_debug(
                         "CONNECT tunnel client disconnected. session_id=%lu",
                         session->session_id
                     );
@@ -395,6 +612,18 @@ static int raw_tunnel_loop(
             int recv_len = recv(upstream_sock, tunnel_buffer, BUFFER_SIZE, 0);
 
             if (recv_len > 0) {
+                if (upload_discovery_active) {
+                    ULONGLONG now_ms = GetTickCount64();
+
+                    if (now_ms - discovery_window_started_ms > UPLOAD_HOST_DISCOVERY_WINDOW_MS) {
+                        discovery_window_started_ms = now_ms;
+                        discovery_window_client_bytes = 0;
+                        discovery_window_upstream_bytes = 0;
+                    }
+                    discovery_window_upstream_bytes += (unsigned long long)recv_len;
+                    discovery_upstream_data_observed = 1;
+                }
+
                 session_context_add_bytes_from_upstream(session, recv_len);
 
                 if (send_all(client_sock, tunnel_buffer, recv_len) == SOCKET_ERROR) {
@@ -442,6 +671,25 @@ static int raw_tunnel_loop(
                 break;
             }
         }
+
+        if (upload_discovery_active &&
+            !upload_candidate_logged &&
+            discovery_upstream_data_observed &&
+            discovery_window_client_bytes >= discovery_min_upload_bytes &&
+            discovery_window_client_bytes >= discovery_window_upstream_bytes * 2ULL) {
+            log_info(
+                "UPLOAD_HOST_CANDIDATE session_id=%lu process=%s target=%s:%d signal=outbound_burst window_outbound_bytes=%llu window_inbound_bytes=%llu min_upload_bytes=%llu window_ms=%llu mode=encrypted_metadata_only payload_decrypted=false",
+                session->session_id,
+                session->process.process_name[0] != '\0' ? session->process.process_name : "-",
+                safe_log_string(target_host),
+                target_port,
+                discovery_window_client_bytes,
+                discovery_window_upstream_bytes,
+                discovery_min_upload_bytes,
+                (unsigned long long)UPLOAD_HOST_DISCOVERY_WINDOW_MS
+            );
+            upload_candidate_logged = 1;
+        }
     }
 
     finished_ms = GetTickCount64();
@@ -460,6 +708,20 @@ static int raw_tunnel_loop(
             (unsigned long long)(finished_ms - started_ms),
             finish_reason,
             result
+        );
+    }
+    else if (upload_discovery_active) {
+        log_upload_host_discovery_summary(
+            session,
+            target_host,
+            target_port,
+            discovery_min_upload_bytes,
+            session->bytes_to_upstream,
+            session->bytes_from_upstream,
+            (unsigned long long)(finished_ms - started_ms),
+            finish_reason,
+            result,
+            upload_candidate_logged
         );
     }
 
@@ -598,6 +860,16 @@ static int handle_connect_request(
         session->process.process_name,
         &tls_policy_decision
     );
+    if (apply_upload_capture_mitm_override(session, &target, &tls_policy_decision)) {
+        log_security(
+            "UPLOAD_CAPTURE_MITM_SELECTED session_id=%lu process=%s target=%s:%d source=%s",
+            session->session_id,
+            session->process.process_name[0] != '\0' ? session->process.process_name : "-",
+            target.host,
+            target.port,
+            UPLOAD_CAPTURE_HOSTS_FILE_PATH
+        );
+    }
 
     suppress_policy_logs = (tls_policy_decision.action == TLS_INTERCEPT_ACTION_IGNORE);
 
@@ -690,7 +962,7 @@ static int handle_connect_request(
 
 #if ENABLE_TLS_MITM
     if (!suppress_policy_logs) {
-        log_info(
+        log_debug(
             "connected to CONNECT upstream. session_id=%lu host=%s upstream=%s:%d",
             session->session_id,
             target.host,
@@ -699,7 +971,7 @@ static int handle_connect_request(
         );
     }
 #else
-    log_info(
+    log_debug(
         "connected to CONNECT upstream. session_id=%lu host=%s upstream=%s:%d",
         session->session_id,
         target.host,
@@ -722,7 +994,7 @@ static int handle_connect_request(
 
 #if ENABLE_TLS_MITM
     if (!suppress_policy_logs) {
-        log_info(
+        log_debug(
             "CONNECT tunnel established. session_id=%lu target=%s upstream=%s:%d",
             session->session_id,
             target.host,
@@ -732,7 +1004,7 @@ static int handle_connect_request(
         audit_log_connect_tunnel_event(session, request);
     }
 #else
-    log_info(
+    log_debug(
         "CONNECT tunnel established. session_id=%lu target=%s upstream=%s:%d",
         session->session_id,
         target.host,
@@ -1008,10 +1280,11 @@ int relay_loop(proxy_session_context_t* session)
                         }
 
                         if (!should_suppress_connect_policy_logs(session, &request)) {
-                            print_http_request(&request);
+                            if (logger_is_debug_enabled()) {
+                                print_http_request(&request);
+                            }
+                            log_http_request_analysis(&request, session->session_id, "HTTP");
                         }
-
-                        log_http_request_analysis(&request, session->session_id, "HTTP");
 
                         if (is_connect_request(&request)) {
                             loop_result = handle_connect_request(
@@ -1056,7 +1329,9 @@ int relay_loop(proxy_session_context_t* session)
                             }
 
                         dlp_result = inspect_dlp_request(request_for_dlp);
-                        inspect_multipart_upload_request(request_for_dlp, &dlp_result);
+                        if (dlp_request_should_inspect(request_for_dlp)) {
+                            inspect_multipart_upload_request(request_for_dlp, &dlp_result);
+                        }
 
                         if (dlp_result.action == DLP_ACTION_BLOCK) {
                             int block_response_sent;
@@ -1297,7 +1572,9 @@ int relay_loop(proxy_session_context_t* session)
                             const http_response_t* response_for_dlp;
                             int decode_result;
 
-                            print_http_response(&response);
+                            if (logger_is_debug_enabled()) {
+                                print_http_response(&response);
+                            }
                             log_http_response_analysis(&response, session->session_id, "HTTP");
 
                             memset(&decoded_response_for_dlp, 0, sizeof(decoded_response_for_dlp));
@@ -1508,7 +1785,7 @@ int handle_client_session(proxy_session_context_t* session)
     relay_result = relay_loop(session);
 
     if (relay_result == 0) {
-        log_info(
+        log_debug(
             "relay_loop finished normally. session_id=%lu",
             session->session_id
         );
@@ -1530,6 +1807,7 @@ int handle_client_session(proxy_session_context_t* session)
 static unsigned __stdcall client_thread_proc(void* arg)
 {
     proxy_session_context_t* session;
+    int suppress_application_logs;
 
     session = (proxy_session_context_t*)arg;
 
@@ -1543,7 +1821,10 @@ static unsigned __stdcall client_thread_proc(void* arg)
         (unsigned int)GetCurrentThreadId()
     );
 
-    log_info(
+    suppress_application_logs = !is_web_browser_process(&session->process);
+    logger_set_thread_suppressed(suppress_application_logs);
+
+    log_debug(
         "client thread started. session_id=%lu thread_id=%u",
         session->session_id,
         session->thread_id
@@ -1551,11 +1832,13 @@ static unsigned __stdcall client_thread_proc(void* arg)
 
     handle_client_session(session);
 
-    log_info(
+    log_debug(
         "client thread finished. session_id=%lu thread_id=%u",
         session->session_id,
         session->thread_id
     );
+
+    logger_set_thread_suppressed(0);
 
     free(session);
 
@@ -1653,13 +1936,75 @@ static SOCKET create_exclusive_listener(int port)
     return listen_sock;
 }
 
-int main(void)
+static int run_file_analyzer_cli(const char* file_path, const char* content_type)
+{
+    FILE* file = NULL;
+    long file_size;
+    unsigned char* data = NULL;
+    size_t bytes_read;
+    const char* filename;
+    const char* slash;
+    const char* backslash;
+    file_analysis_result_t result;
+    int exit_code = 1;
+
+    if (file_path == NULL || file_path[0] == '\0') return 1;
+    if (fopen_s(&file, file_path, "rb") != 0 || file == NULL) {
+        fprintf(stderr, "file analyzer: cannot open %s\n", file_path);
+        return 1;
+    }
+    if (fseek(file, 0, SEEK_END) != 0 || (file_size = ftell(file)) <= 0 ||
+        file_size > 32L * 1024L * 1024L || fseek(file, 0, SEEK_SET) != 0) {
+        fprintf(stderr, "file analyzer: unsupported file size\n");
+        goto cleanup;
+    }
+    data = (unsigned char*)malloc((size_t)file_size);
+    if (data == NULL) goto cleanup;
+    bytes_read = fread(data, 1, (size_t)file_size, file);
+    if (bytes_read != (size_t)file_size) goto cleanup;
+
+    slash = strrchr(file_path, '/');
+    backslash = strrchr(file_path, '\\');
+    filename = file_path;
+    if (slash != NULL && slash + 1 > filename) filename = slash + 1;
+    if (backslash != NULL && backslash + 1 > filename) filename = backslash + 1;
+
+    if (file_analyzer_inspect(filename, content_type, data, bytes_read, &result) != 0) {
+        fprintf(stderr, "file analyzer: inspection failed\n");
+        goto cleanup;
+    }
+    printf(
+        "FILE ANALYSIS file=\"%s\" bytes=%llu type=%s format=%s entries=%u "
+        "extracted_text_bytes=%llu sha256=%s action=%s reason=\"%s\"\n",
+        filename,
+        (unsigned long long)bytes_read,
+        content_type != NULL && content_type[0] ? content_type : "unknown",
+        result.format,
+        result.archive_entries,
+        result.extracted_text_bytes,
+        result.sha256[0] ? result.sha256 : "unavailable",
+        result.action == FILE_ANALYSIS_BLOCK ? "BLOCK" : "ALLOW",
+        result.reason
+    );
+    exit_code = result.action == FILE_ANALYSIS_BLOCK ? 2 : 0;
+
+cleanup:
+    free(data);
+    if (file != NULL) fclose(file);
+    return exit_code;
+}
+
+int main(int argc, char** argv)
 {
     WSADATA wsaData;
 
     SOCKET listen_sock = INVALID_SOCKET;
 
     char cwd[512];
+
+    if (argc >= 3 && _stricmp(argv[1], "--analyze-file") == 0) {
+        return run_file_analyzer_cli(argv[2], argc >= 4 ? argv[3] : "application/octet-stream");
+    }
 
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
         printf("[ERROR] WSAStartup failed\n");
@@ -1677,6 +2022,10 @@ int main(void)
         printf("[WARN] logger_init failed. continue without file logging.\n");
     }
 
+    if (upload_tracker_init() != 0) {
+        log_warn("upload_tracker_init() failed. original file-name correlation is disabled.");
+    }
+
     if (policy_engine_init(POLICY_FILE_PATH) != 0) {
         log_warn("policy_engine_init() failed. continue with available policy rules.");
     }
@@ -1684,6 +2033,9 @@ int main(void)
 #if ENABLE_TLS_MITM
     if (tls_intercept_policy_load(TLS_INTERCEPT_POLICY_FILE_PATH) != 0) {
         log_warn("tls_intercept_policy_load() failed. continue with safe default TLS intercept policy.");
+    }
+    if (upload_capture_init(UPLOAD_CAPTURE_HOSTS_FILE_PATH) != 0) {
+        log_warn("upload_capture_init() failed. continue without confirmed-host body capture.");
     }
 #endif
 
@@ -1698,6 +2050,8 @@ int main(void)
         log_error("create_exclusive_listener() failed. Check whether another relay_proxy.exe is already using port %d", PROXY_PORT);
 
         tls_intercept_policy_cleanup();
+        upload_capture_cleanup();
+        upload_tracker_cleanup();
         policy_engine_cleanup();
         logger_close();
         WSACleanup();
@@ -1710,6 +2064,14 @@ int main(void)
     #if ENABLE_TLS_MITM
     log_info("CONNECT TLS MITM mode enabled with TLS intercept policy. Policy actions: MITM, BYPASS, BLOCK, AUDIT, IGNORE.");
     log_info("CONNECT TLS intercept policy file: %s", TLS_INTERCEPT_POLICY_FILE_PATH);
+    log_info("HTTPS DLP protocol mode: ALPN auto-select with HTTP/1.1 and HTTP/2 enforcement.");
+    if (upload_host_discovery_enabled()) {
+        log_info(
+            "Upload host discovery enabled for browser IGNORE tunnels. min_upload_bytes=%llu window_ms=%llu mode=encrypted_metadata_only",
+            upload_host_discovery_min_bytes(),
+            (unsigned long long)UPLOAD_HOST_DISCOVERY_WINDOW_MS
+        );
+    }
 #else
     log_info("CONNECT tunnel mode enabled. CONNECT traffic is relayed as raw encrypted TCP.");
 #endif
@@ -1725,7 +2087,7 @@ int main(void)
 
         memset(&client_addr, 0, sizeof(client_addr));
 
-        log_info("waiting for client connection...");
+        log_debug("waiting for client connection...");
 
         client_sock = accept(
             listen_sock,
@@ -1753,8 +2115,6 @@ int main(void)
             0
         );
 
-        session_context_log_created(session);
-
         {
             process_metadata_t process_metadata;
 
@@ -1768,10 +2128,13 @@ int main(void)
                 &process_metadata
             ) == 0) {
                 session_context_set_process_metadata(session, &process_metadata);
-                process_metadata_log(session->session_id, &process_metadata);
+                if (is_web_browser_process(&process_metadata)) {
+                    session_context_log_created(session);
+                    process_metadata_log(session->session_id, &process_metadata);
+                }
             }
             else {
-                log_warn(
+                log_debug(
                     "failed to lookup process metadata. session_id=%lu client=%s:%d proxy=%s:%d",
                     session->session_id,
                     session->client_ip,
@@ -1805,7 +2168,7 @@ int main(void)
             continue;
         }
 
-        log_info(
+        log_debug(
             "client thread created. session_id=%lu thread_id=%u",
             session->session_id,
             thread_id
@@ -1820,7 +2183,9 @@ int main(void)
 
 #if ENABLE_TLS_MITM
     tls_intercept_policy_cleanup();
+    upload_capture_cleanup();
 #endif
+    upload_tracker_cleanup();
     policy_engine_cleanup();
     logger_close();
     WSACleanup();

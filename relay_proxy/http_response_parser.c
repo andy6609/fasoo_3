@@ -628,7 +628,7 @@ void log_http_response_analysis(
 
     for (i = 0; i < response->header_count; i++) {
         const http_header_t* header = &response->headers[i];
-        log_info(
+        log_debug(
             "HTTP_ANALYSIS direction=RESPONSE session_id=%lu header=%s value=%s%s",
             session_id, header->name,
             header_is_sensitive(header->name) ? "[REDACTED]" : header->value,
@@ -637,17 +637,17 @@ void log_http_response_analysis(
     }
 
     if (response->body_length <= 0) {
-        log_info("HTTP_ANALYSIS direction=RESPONSE session_id=%lu body=-", session_id);
+        log_debug("HTTP_ANALYSIS direction=RESPONSE session_id=%lu body=-", session_id);
     }
     else if (!content_type_is_textual(response->content_type)) {
-        log_info("HTTP_ANALYSIS direction=RESPONSE session_id=%lu body=[binary or unsupported content type omitted]", session_id);
+        log_debug("HTTP_ANALYSIS direction=RESPONSE session_id=%lu body=[binary or unsupported content type omitted]", session_id);
     }
     else if (body_may_be_sensitive(response->body)) {
-        log_info("HTTP_ANALYSIS direction=RESPONSE session_id=%lu body=[REDACTED: sensitive field detected]", session_id);
+        log_debug("HTTP_ANALYSIS direction=RESPONSE session_id=%lu body=[REDACTED: sensitive field detected]", session_id);
     }
     else {
         make_log_preview(response->body, response->body_length, body_preview, sizeof(body_preview));
-        log_info("HTTP_ANALYSIS direction=RESPONSE session_id=%lu body_preview=%s%s", session_id,
+        log_debug("HTTP_ANALYSIS direction=RESPONSE session_id=%lu body_preview=%s%s", session_id,
             body_preview, response->body_length >= (int)sizeof(body_preview) ? " [truncated]" : "");
     }
 }

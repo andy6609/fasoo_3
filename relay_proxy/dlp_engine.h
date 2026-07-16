@@ -19,5 +19,7 @@ typedef struct {
 
 dlp_result_t inspect_dlp_request(const http_request_t* request);
 dlp_result_t inspect_dlp_response(const http_response_t* response);
+int dlp_request_is_file_upload(const http_request_t* request);
+int dlp_request_should_inspect(const http_request_t* request);
 
 #endif

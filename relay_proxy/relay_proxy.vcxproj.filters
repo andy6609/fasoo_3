@@ -90,6 +90,15 @@
     <ClCompile Include="chunked_decoder.c">
       <Filter>소스 파일</Filter>
     </ClCompile>
+    <ClCompile Include="upload_capture.c">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="upload_tracker.c">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="file_analyzer.c">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="socket_utils.h">
@@ -162,6 +171,15 @@
       <Filter>헤더 파일</Filter>
     </ClInclude>
     <ClInclude Include="chunked_decoder.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
+    <ClInclude Include="upload_capture.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
+    <ClInclude Include="upload_tracker.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
+    <ClInclude Include="file_analyzer.h">
       <Filter>헤더 파일</Filter>
     </ClInclude>
   </ItemGroup>

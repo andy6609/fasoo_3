@@ -6,6 +6,16 @@ echo  Enable Windows User Proxy: 127.0.0.1:8000
 echo ============================================================
 echo.
 
+netstat -ano | findstr /R /C:":8000 .*LISTENING" >nul
+if errorlevel 1 (
+  echo [ERROR] relay_proxy is not listening on port 8000.
+  echo [INFO] Windows proxy settings were not changed.
+  echo [INFO] Start ..\x64\Debug\relay_proxy.exe first, then run this script again.
+  echo.
+  pause
+  exit /b 1
+)
+
 echo [INFO] Setting WinINet proxy for current user...
 
 reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings" /v ProxyEnable /t REG_DWORD /d 1 /f >nul

@@ -450,7 +450,7 @@ static int tls_intercept_policy_add_rule_text(const char* raw_text, int line_num
         g_default_action = action;
         tls_intercept_policy_set_default_reason(reason_text);
 
-        log_info(
+        log_debug(
             "TLS intercept policy default action loaded. action=%s reason=\"%s\"",
             tls_intercept_policy_action_to_string(g_default_action),
             g_default_reason
@@ -549,7 +549,7 @@ static int tls_intercept_policy_add_rule_text(const char* raw_text, int line_num
 
     g_rule_count++;
 
-    log_info(
+    log_debug(
         "TLS intercept policy rule loaded. index=%d process=%s host=%s port=%d action=%s host_mode=%s reason=\"%s\"",
         g_rule_count,
         rule->process,
@@ -769,7 +769,7 @@ static int tls_intercept_policy_decide_with_process_internal(
     if (host == NULL || host[0] == '\0') {
         tls_intercept_policy_fill_decision(decision, "-", port, clean_process, NULL, 0, 1);
         if (log_decision) {
-            log_info(
+            log_debug(
                 "TLS intercept policy decision. process=%s host=- port=%d action=%s matched=default reason=\"%s\"",
                 clean_process,
                 port,
@@ -800,7 +800,7 @@ static int tls_intercept_policy_decide_with_process_internal(
             tls_intercept_policy_fill_decision(decision, clean_host, port, clean_process, rule, 1, 0);
 
             if (log_decision && rule->action != TLS_INTERCEPT_ACTION_IGNORE) {
-                log_info(
+                log_debug(
                     "TLS intercept policy decision. process=%s host=%s port=%d action=%s matched=rule rule_process=%s rule_host=%s rule_port=%d reason=\"%s\"",
                     clean_process,
                     clean_host,
@@ -820,7 +820,7 @@ static int tls_intercept_policy_decide_with_process_internal(
     tls_intercept_policy_fill_decision(decision, clean_host, port, clean_process, NULL, 0, 1);
 
     if (log_decision) {
-        log_info(
+        log_debug(
             "TLS intercept policy decision. process=%s host=%s port=%d action=%s matched=default reason=\"%s\"",
             clean_process,
             clean_host,

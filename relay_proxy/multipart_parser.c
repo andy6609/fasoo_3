@@ -12,10 +12,6 @@
 #define MULTIPART_BOUNDARY_SIZE 160
 #define MULTIPART_FILENAME_SIZE 260
 #define MULTIPART_EXT_SIZE 32
-#define MULTIPART_MAX_SCAN_BYTES (1024 * 1024)
-#define MULTIPART_MAX_FILE_SIZE_BYTES (10 * 1024 * 1024)
-#define MULTIPART_SCAN_CHUNK_BYTES 4096
-#define MULTIPART_RULE_MAX_FILE_SIZE 11
 #define REQUEST_BODY_FALLBACK_SCAN_BYTES (20 * 1024 * 1024)
 
 static int safe_set_result(
@@ -127,46 +123,6 @@ static size_t bounded_strlen(const char* value, size_t limit)
 }
 
 
-static size_t read_size_limit_from_env(const char* name, size_t default_value)
-{
-    char buffer[64];
-    size_t required_size;
-    unsigned long long parsed;
-    char* endptr;
-
-    if (name == NULL || name[0] == '\0') {
-        return default_value;
-    }
-
-    buffer[0] = '\0';
-    required_size = 0;
-
-    if (getenv_s(&required_size, buffer, sizeof(buffer), name) != 0 || required_size == 0) {
-        return default_value;
-    }
-
-    parsed = strtoull(buffer, &endptr, 10);
-    if (endptr == buffer || parsed == 0) {
-        return default_value;
-    }
-
-    if (parsed > (unsigned long long)((size_t)-1)) {
-        return default_value;
-    }
-
-    return (size_t)parsed;
-}
-
-static size_t multipart_max_file_size_bytes(void)
-{
-    return read_size_limit_from_env("LOCAL_DLP_MAX_UPLOAD_BYTES", MULTIPART_MAX_FILE_SIZE_BYTES);
-}
-
-static size_t multipart_max_scan_bytes(void)
-{
-    return read_size_limit_from_env("LOCAL_DLP_MAX_MULTIPART_SCAN_BYTES", MULTIPART_MAX_SCAN_BYTES);
-}
-
 static size_t min_size_t(size_t a, size_t b)
 {
     return a < b ? a : b;
@@ -262,44 +218,6 @@ static void extract_part_content_type(const char* header, size_t header_len, cha
     if (len >= output_size) len = output_size - 1;
     memcpy(output, p, len);
     output[len] = '\0';
-}
-
-static int block_large_multipart_request_if_needed(
-    const http_request_t* request,
-    dlp_result_t* result
-)
-{
-    size_t max_file_size;
-    size_t declared_len;
-    char reason[256];
-
-    if (request == NULL || result == NULL || request->content_length <= 0) {
-        return 0;
-    }
-
-    max_file_size = multipart_max_file_size_bytes();
-    declared_len = (size_t)request->content_length;
-
-    if (declared_len <= max_file_size) {
-        return 0;
-    }
-
-    _snprintf_s(
-        reason,
-        sizeof(reason),
-        _TRUNCATE,
-        "Multipart upload blocked. request body too large: bytes=%lu limit=%lu",
-        (unsigned long)declared_len,
-        (unsigned long)max_file_size
-    );
-
-    log_security(
-        "Multipart MAX_FILE_SIZE matched before full part parse. content_length=%lu limit=%lu",
-        (unsigned long)declared_len,
-        (unsigned long)max_file_size
-    );
-
-    return safe_set_result(result, DLP_ACTION_BLOCK, MULTIPART_RULE_MAX_FILE_SIZE, "MAX_FILE_SIZE", reason);
 }
 
 static int safe_set_result(
@@ -504,110 +422,6 @@ static void extract_file_extension(
     ext[i] = '\0';
 }
 
-static int streaming_sample_contains_keyword(
-    const char* part_body,
-    size_t part_body_len,
-    size_t sample_limit,
-    const char* keyword,
-    size_t* scanned_bytes
-)
-{
-    size_t keyword_len;
-    size_t scan_len;
-    size_t offset;
-    size_t overlap_len;
-    char window[MULTIPART_SCAN_CHUNK_BYTES + 128];
-
-    if (scanned_bytes != NULL) {
-        *scanned_bytes = 0;
-    }
-
-    if (part_body == NULL || keyword == NULL || keyword[0] == '\0') {
-        return 0;
-    }
-
-    keyword_len = strlen(keyword);
-    if (keyword_len >= sizeof(window)) {
-        return find_text_ci_n(part_body, part_body_len < sample_limit ? part_body_len : sample_limit, keyword) != NULL;
-    }
-
-    scan_len = part_body_len < sample_limit ? part_body_len : sample_limit;
-    offset = 0;
-    overlap_len = 0;
-
-    while (offset < scan_len) {
-        size_t remaining;
-        size_t chunk_len;
-        size_t window_len;
-        size_t next_overlap_len;
-
-        remaining = scan_len - offset;
-        chunk_len = remaining < MULTIPART_SCAN_CHUNK_BYTES ? remaining : MULTIPART_SCAN_CHUNK_BYTES;
-
-        if (overlap_len > 0) {
-            memmove(window, window + MULTIPART_SCAN_CHUNK_BYTES, overlap_len);
-        }
-
-        memcpy(window + overlap_len, part_body + offset, chunk_len);
-        window_len = overlap_len + chunk_len;
-
-        if (find_text_ci_n(window, window_len, keyword) != NULL) {
-            if (scanned_bytes != NULL) {
-                *scanned_bytes = offset + chunk_len;
-            }
-            return 1;
-        }
-
-        next_overlap_len = keyword_len > 1 ? keyword_len - 1 : 0;
-        if (next_overlap_len > window_len) {
-            next_overlap_len = window_len;
-        }
-
-        if (next_overlap_len > 0) {
-            memcpy(window + MULTIPART_SCAN_CHUNK_BYTES, window + window_len - next_overlap_len, next_overlap_len);
-        }
-        overlap_len = next_overlap_len;
-        offset += chunk_len;
-    }
-
-    if (scanned_bytes != NULL) {
-        *scanned_bytes = scan_len;
-    }
-
-    return 0;
-}
-
-static int part_body_looks_like_email(const char* part_body, size_t part_body_len)
-{
-    const char* at;
-    const char* dot;
-
-    at = find_bytes_n(part_body, part_body_len, "@", 1);
-    if (at == NULL) {
-        return 0;
-    }
-
-    dot = find_bytes_n(at, part_body_len - (size_t)(at - part_body), ".", 1);
-    return dot != NULL;
-}
-
-
-static int part_body_sample_looks_like_email(
-    const char* part_body,
-    size_t part_body_len,
-    size_t sample_limit
-)
-{
-    size_t scan_len;
-
-    if (part_body == NULL) {
-        return 0;
-    }
-
-    scan_len = part_body_len < sample_limit ? part_body_len : sample_limit;
-    return part_body_looks_like_email(part_body, scan_len);
-}
-
 static int inspect_one_file_part(
     const char* filename,
     const char* field_name,
@@ -621,9 +435,6 @@ static int inspect_one_file_part(
     char reason[256];
     const char* base;
     int changed;
-    size_t max_file_size;
-    size_t max_scan_bytes;
-    size_t scanned_bytes;
     char hash[65];
     const char* signature;
     int signature_mismatch;
@@ -633,9 +444,6 @@ static int inspect_one_file_part(
     }
 
     changed = 0;
-    scanned_bytes = 0;
-    max_file_size = multipart_max_file_size_bytes();
-    max_scan_bytes = multipart_max_scan_bytes();
     base = filename_basename(filename);
     extract_file_extension(filename, ext, sizeof(ext));
 
@@ -644,7 +452,7 @@ static int inspect_one_file_part(
     signature_mismatch = !signature_matches_extension(signature, ext);
 
     log_security(
-        "FILE_UPLOAD field=%s filename=%s extension=%s mime=%s size=%lu sha256=%s signature=%s signature_mismatch=%s max_file_bytes=%lu scan_limit_bytes=%lu",
+        "FILE_UPLOAD field=%s filename=%s extension=%s mime=%s size=%lu sha256=%s signature=%s signature_mismatch=%s inspection=file_metadata_only",
         field_name != NULL && field_name[0] != '\0' ? field_name : "-",
         base,
         ext[0] != '\0' ? ext : "-",
@@ -652,9 +460,7 @@ static int inspect_one_file_part(
         (unsigned long)part_body_len,
         hash[0] != '\0' ? hash : "-",
         signature,
-        signature_mismatch ? "true" : "false",
-        (unsigned long)max_file_size,
-        (unsigned long)max_scan_bytes
+        signature_mismatch ? "true" : "false"
     );
 
     if (signature_mismatch) {
@@ -664,92 +470,7 @@ static int inspect_one_file_part(
         return safe_set_result(result, DLP_ACTION_BLOCK, 12, "SIGNATURE_MISMATCH", reason);
     }
 
-    if (_stricmp(ext, ".zip") == 0) {
-        _snprintf_s(
-            reason,
-            sizeof(reason),
-            _TRUNCATE,
-            "Multipart upload blocked. blocked file extension detected: %s",
-            ext
-        );
-        return safe_set_result(result, DLP_ACTION_BLOCK, 9, ext, reason);
-    }
-
-    if (part_body_len > max_file_size) {
-        _snprintf_s(
-            reason,
-            sizeof(reason),
-            _TRUNCATE,
-            "Multipart upload blocked. file too large: %s bytes=%lu limit=%lu",
-            base,
-            (unsigned long)part_body_len,
-            (unsigned long)max_file_size
-        );
-        return safe_set_result(result, DLP_ACTION_BLOCK, MULTIPART_RULE_MAX_FILE_SIZE, "MAX_FILE_SIZE", reason);
-    }
-
-    if (part_body_len > max_scan_bytes) {
-        log_security(
-            "Multipart streaming sample scan enabled. filename=%s file_body_bytes=%lu scanned_body_bytes=%lu",
-            base,
-            (unsigned long)part_body_len,
-            (unsigned long)max_scan_bytes
-        );
-    }
-    else {
-        log_debug(
-            "Multipart file content scan. filename=%s scanned_body_bytes=%lu",
-            base,
-            (unsigned long)part_body_len
-        );
-    }
-
-    if (streaming_sample_contains_keyword(part_body, part_body_len, max_scan_bytes, "secret", &scanned_bytes)) {
-        _snprintf_s(
-            reason,
-            sizeof(reason),
-            _TRUNCATE,
-            "Multipart upload blocked. sensitive keyword detected in uploaded file sample: %s scanned=%lu",
-            base,
-            (unsigned long)scanned_bytes
-        );
-        return safe_set_result(result, DLP_ACTION_BLOCK, 1, "secret", reason);
-    }
-
-    if (streaming_sample_contains_keyword(part_body, part_body_len, max_scan_bytes, "password", &scanned_bytes)) {
-        _snprintf_s(
-            reason,
-            sizeof(reason),
-            _TRUNCATE,
-            "Multipart upload blocked. password keyword detected in uploaded file sample: %s scanned=%lu",
-            base,
-            (unsigned long)scanned_bytes
-        );
-        return safe_set_result(result, DLP_ACTION_BLOCK, 2, "password", reason);
-    }
-
-    if (part_body_sample_looks_like_email(part_body, part_body_len, max_scan_bytes)) {
-        _snprintf_s(
-            reason,
-            sizeof(reason),
-            _TRUNCATE,
-            "Multipart upload blocked. email-like pattern detected in uploaded file sample: %s",
-            base
-        );
-        return safe_set_result(result, DLP_ACTION_BLOCK, 4, "EMAIL", reason);
-    }
-
-    if (_stricmp(ext, ".xlsx") == 0) {
-        _snprintf_s(
-            reason,
-            sizeof(reason),
-            _TRUNCATE,
-            "Multipart upload log-only. Excel file upload detected: %s",
-            base
-        );
-        changed = safe_set_result(result, DLP_ACTION_LOG_ONLY, 8, ext, reason);
-    }
-    else if (result->action == DLP_ACTION_ALLOW) {
+    if (result->action == DLP_ACTION_ALLOW) {
         _snprintf_s(
             reason,
             sizeof(reason),
@@ -789,10 +510,6 @@ int inspect_multipart_upload_request(const http_request_t* request, dlp_result_t
     body = request->body_data != NULL ? request->body_data : request->body;
     if (body == NULL) {
         return 0;
-    }
-
-    if (block_large_multipart_request_if_needed(request, result)) {
-        return 1;
     }
 
     body_len = request->body_data != NULL && request->body_data_length >= 0

@@ -15,6 +15,21 @@ static const char* safe_string(const char* value)
     return value;
 }
 
+static const char* safe_request_path(const char* path)
+{
+    static __declspec(thread) char sanitized[512];
+    const char* query;
+    size_t length;
+
+    if (path == NULL || path[0] == '\0') return "-";
+    query = strchr(path, '?');
+    length = query != NULL ? (size_t)(query - path) : strlen(path);
+    if (length >= sizeof(sanitized)) length = sizeof(sanitized) - 1;
+    memcpy(sanitized, path, length);
+    sanitized[length] = '\0';
+    return sanitized;
+}
+
 static unsigned long safe_session_id(const proxy_session_context_t* session)
 {
     if (session == NULL) {
@@ -126,7 +141,7 @@ void audit_log_block_event(
         safe_process_name(session),
         safe_process_path(session),
         safe_string(request->method),
-        safe_string(request->path),
+        safe_request_path(request->path),
         safe_string(request->host),
         result->matched_rule_id,
         safe_string(result->keyword),
@@ -164,7 +179,7 @@ void audit_log_log_only_event(
         safe_process_name(session),
         safe_process_path(session),
         safe_string(request->method),
-        safe_string(request->path),
+        safe_request_path(request->path),
         safe_string(request->host),
         result->matched_rule_id,
         safe_string(result->keyword),
@@ -252,14 +267,14 @@ void audit_log_connect_tunnel_event(
 )
 {
     if (request == NULL) {
-        log_security(
+        log_debug(
             "AUDIT session_id=%lu direction=CONNECT action=TUNNEL error=\"invalid audit input\"",
             safe_session_id(session)
         );
         return;
     }
 
-    log_security(
+    log_debug(
         "AUDIT session_id=%lu thread_id=%u direction=CONNECT action=TUNNEL "
         "client=%s:%d upstream=%s:%d "
         "process_id=%lu process_name=%s process_path=\"%s\" "

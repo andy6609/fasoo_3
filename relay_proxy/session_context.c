@@ -211,7 +211,7 @@ void session_context_log_created(const proxy_session_context_t* session)
         return;
     }
 
-    log_info(
+    log_debug(
         "session created. session_id=%lu client=%s:%d proxy=%s:%d upstream=%s:%d",
         session->session_id,
         session->client_ip,
@@ -231,17 +231,13 @@ void session_context_log_started(const proxy_session_context_t* session)
     }
 
     log_info(
-        "session started. session_id=%lu thread_id=%u client=%s:%d proxy=%s:%d upstream=%s:%d process_id=%lu process_name=%s",
+        "========== SESSION BEGIN id=%lu client=%s:%d process=%s(pid=%lu) thread=%u ==========",
         session->session_id,
-        session->thread_id,
         session->client_ip,
         session->client_port,
-        session->proxy_ip,
-        session->proxy_port,
-        session->upstream_ip,
-        session->upstream_port,
+        session->process.process_name,
         (unsigned long)session->process.process_id,
-        session->process.process_name
+        session->thread_id
     );
 }
 
@@ -253,16 +249,12 @@ void session_context_log_finished(const proxy_session_context_t* session)
     }
 
     log_info(
-        "session finished. session_id=%lu thread_id=%u process_id=%lu process_name=%s "
-        "bytes_from_client=%llu bytes_to_upstream=%llu "
-        "bytes_from_upstream=%llu bytes_to_client=%llu",
+        "========== SESSION END id=%lu process=%s traffic=client:%llu/%llu upstream:%llu/%llu ==========",
         session->session_id,
-        session->thread_id,
-        (unsigned long)session->process.process_id,
         session->process.process_name,
         session->bytes_from_client,
-        session->bytes_to_upstream,
+        session->bytes_to_client,
         session->bytes_from_upstream,
-        session->bytes_to_client
+        session->bytes_to_upstream
     );
 }

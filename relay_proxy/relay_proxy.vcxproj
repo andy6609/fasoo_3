@@ -108,7 +108,7 @@
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalLibraryDirectories>C:\vcpkg\installed\x64-windows\debug\lib;C:\vcpkg\installed\x64-windows\lib</AdditionalLibraryDirectories>
-      <AdditionalDependencies>zd.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>zd.lib;nghttp2.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -119,10 +119,13 @@
       <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
+      <AdditionalIncludeDirectories>C:\vcpkg\installed\x64-windows\include</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalLibraryDirectories>C:\vcpkg\installed\x64-windows\lib</AdditionalLibraryDirectories>
+      <AdditionalDependencies>z.lib;nghttp2.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -133,6 +136,7 @@
     <ClCompile Include="command_thread.c" />
     <ClCompile Include="content_decoder.c" />
     <ClCompile Include="dlp_engine.c" />
+    <ClCompile Include="file_analyzer.c" />
     <ClCompile Include="http_block_response.c" />
     <ClCompile Include="http2_engine.c" />
     <ClCompile Include="http_parser.c" />
@@ -150,6 +154,8 @@
     <ClCompile Include="socket_utils.c" />
     <ClCompile Include="tls_intercept_policy.c" />
     <ClCompile Include="tls_mitm_engine.c" />
+    <ClCompile Include="upload_capture.c" />
+    <ClCompile Include="upload_tracker.c" />
     <ClCompile Include="upstream_resolver.c" />
   </ItemGroup>
   <ItemGroup>
@@ -160,6 +166,7 @@
     <ClInclude Include="command_thread.h" />
     <ClInclude Include="content_decoder.h" />
     <ClInclude Include="dlp_engine.h" />
+    <ClInclude Include="file_analyzer.h" />
     <ClInclude Include="http_block_response.h" />
     <ClInclude Include="http2_engine.h" />
     <ClInclude Include="http_parser.h" />
@@ -176,7 +183,12 @@
     <ClInclude Include="socket_utils.h" />
     <ClInclude Include="tls_intercept_policy.h" />
     <ClInclude Include="tls_mitm_engine.h" />
+    <ClInclude Include="upload_capture.h" />
+    <ClInclude Include="upload_tracker.h" />
     <ClInclude Include="upstream_resolver.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="upload_capture_hosts.txt" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

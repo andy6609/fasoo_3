@@ -1,0 +1,14 @@
+# Confirmed browser upload hosts only.
+#
+# Format:
+#   <browser-process> <exact-host-or-wildcard>:<port>
+#
+# Copy the target from an UPLOAD_HOST_CANDIDATE event, verify it by repeating
+# one controlled upload, then add the exact host here. Examples remain disabled:
+#
+# chrome.exe confirmed-upload.example.com:443
+# msedge.exe confirmed-upload.example.com:443
+# firefox.exe *.confirmed-upload.example.com:443
+#
+# Capturing is disabled unless LOCAL_DLP_CAPTURE_UPLOAD_BODIES=1 is set.
+# A matching entry forces MITM for that browser/host on the next connection.
