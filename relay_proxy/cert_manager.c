@@ -30,6 +30,35 @@
 #define MITM_CA_KEY_FILE  "certs\\mitm.key"
 #define GENERATED_CERT_DIR "certs\\generated"
 
+static SRWLOCK g_certificate_generation_lock = SRWLOCK_INIT;
+
+static void cert_manager_resolve_runtime_path(
+    const char* relative_path,
+    char* resolved,
+    size_t resolved_size
+)
+{
+    char repository_path[MAX_PATH];
+
+    if (resolved == NULL || resolved_size == 0) return;
+    resolved[0] = '\0';
+    if (relative_path == NULL || relative_path[0] == '\0') return;
+
+    _snprintf_s(
+        repository_path,
+        sizeof(repository_path),
+        _TRUNCATE,
+        "relay_proxy\\%s",
+        relative_path
+    );
+    if (GetFileAttributesA(repository_path) != INVALID_FILE_ATTRIBUTES) {
+        strcpy_s(resolved, resolved_size, repository_path);
+        return;
+    }
+
+    strcpy_s(resolved, resolved_size, relative_path);
+}
+
 static void cert_manager_log_openssl_error(const char* message)
 {
     unsigned long err;
@@ -279,6 +308,53 @@ static EVP_PKEY* cert_manager_load_private_key(const char* path)
     return key;
 }
 
+static int cert_manager_cached_leaf_is_valid(
+    const char* host,
+    const char* cert_path,
+    const char* key_path,
+    const char* ca_cert_path
+)
+{
+    X509* leaf = NULL;
+    X509* ca = NULL;
+    EVP_PKEY* leaf_key = NULL;
+    EVP_PKEY* ca_public_key = NULL;
+    unsigned char address_buffer[16];
+    int host_matches = 0;
+    int valid = 0;
+
+    leaf = cert_manager_load_x509_certificate(cert_path);
+    ca = cert_manager_load_x509_certificate(ca_cert_path);
+    leaf_key = cert_manager_load_private_key(key_path);
+    if (leaf == NULL || ca == NULL || leaf_key == NULL) goto cleanup;
+
+    if (X509_cmp_current_time(X509_get0_notBefore(leaf)) > 0 ||
+        X509_cmp_current_time(X509_get0_notAfter(leaf)) < 0) goto cleanup;
+    if (X509_check_private_key(leaf, leaf_key) != 1) goto cleanup;
+
+    ca_public_key = X509_get_pubkey(ca);
+    if (ca_public_key == NULL || X509_verify(leaf, ca_public_key) != 1) goto cleanup;
+
+    if (InetPtonA(AF_INET, host, address_buffer) == 1 ||
+        InetPtonA(AF_INET6, host, address_buffer) == 1) {
+        host_matches = X509_check_ip_asc(leaf, host, 0) == 1;
+    }
+    else {
+        host_matches = X509_check_host(leaf, host, 0, 0, NULL) == 1;
+    }
+    if (!host_matches) goto cleanup;
+
+    valid = 1;
+
+cleanup:
+    EVP_PKEY_free(ca_public_key);
+    EVP_PKEY_free(leaf_key);
+    X509_free(ca);
+    X509_free(leaf);
+    ERR_clear_error();
+    return valid;
+}
+
 static int cert_manager_write_x509_certificate(const char* path, X509* cert)
 {
     BIO* bio = NULL;
@@ -415,6 +491,8 @@ static int cert_manager_create_leaf_certificate(
 
     char san_value[512];
     char clean_host[CERT_MANAGER_HOST_SIZE];
+    char ca_cert_path[MAX_PATH];
+    char ca_key_path[MAX_PATH];
     long serial;
 
     if (host == NULL || host[0] == '\0' || cert_path == NULL || key_path == NULL) {
@@ -424,12 +502,15 @@ static int cert_manager_create_leaf_certificate(
     memset(clean_host, 0, sizeof(clean_host));
     cert_manager_strip_ipv6_brackets(host, clean_host, sizeof(clean_host));
 
-    ca_cert = cert_manager_load_x509_certificate(MITM_CA_CERT_FILE);
+    cert_manager_resolve_runtime_path(MITM_CA_CERT_FILE, ca_cert_path, sizeof(ca_cert_path));
+    cert_manager_resolve_runtime_path(MITM_CA_KEY_FILE, ca_key_path, sizeof(ca_key_path));
+
+    ca_cert = cert_manager_load_x509_certificate(ca_cert_path);
     if (ca_cert == NULL) {
         goto cleanup;
     }
 
-    ca_key = cert_manager_load_private_key(MITM_CA_KEY_FILE);
+    ca_key = cert_manager_load_private_key(ca_key_path);
     if (ca_key == NULL) {
         goto cleanup;
     }
@@ -632,7 +713,7 @@ cleanup:
     return result;
 }
 
-int cert_manager_get_or_create_leaf_certificate(
+static int cert_manager_get_or_create_leaf_certificate_unlocked(
     const char* host,
     char* cert_path,
     int cert_path_size,
@@ -641,6 +722,9 @@ int cert_manager_get_or_create_leaf_certificate(
 )
 {
     char safe_host[CERT_MANAGER_HOST_SIZE];
+    char ca_cert_path[MAX_PATH];
+    char ca_key_path[MAX_PATH];
+    char generated_cert_dir[MAX_PATH];
 
     if (host == NULL || host[0] == '\0') {
         log_error("cert_manager_get_or_create_leaf_certificate() failed. empty host");
@@ -651,21 +735,21 @@ int cert_manager_get_or_create_leaf_certificate(
         return -1;
     }
 
-    if (!cert_manager_file_exists(MITM_CA_CERT_FILE)) {
-        log_error("MITM CA certificate not found. path=%s", MITM_CA_CERT_FILE);
+    cert_manager_resolve_runtime_path(MITM_CA_CERT_FILE, ca_cert_path, sizeof(ca_cert_path));
+    cert_manager_resolve_runtime_path(MITM_CA_KEY_FILE, ca_key_path, sizeof(ca_key_path));
+    cert_manager_resolve_runtime_path(GENERATED_CERT_DIR, generated_cert_dir, sizeof(generated_cert_dir));
+
+    if (!cert_manager_file_exists(ca_cert_path)) {
+        log_error("MITM CA certificate not found. path=%s", ca_cert_path);
         return -1;
     }
 
-    if (!cert_manager_file_exists(MITM_CA_KEY_FILE)) {
-        log_error("MITM CA private key not found. path=%s", MITM_CA_KEY_FILE);
+    if (!cert_manager_file_exists(ca_key_path)) {
+        log_error("MITM CA private key not found. path=%s", ca_key_path);
         return -1;
     }
 
-    if (cert_manager_ensure_directory("certs") != 0) {
-        return -1;
-    }
-
-    if (cert_manager_ensure_directory(GENERATED_CERT_DIR) != 0) {
+    if (cert_manager_ensure_directory(generated_cert_dir) != 0) {
         return -1;
     }
 
@@ -677,7 +761,7 @@ int cert_manager_get_or_create_leaf_certificate(
         cert_path_size,
         _TRUNCATE,
         "%s\\%s.crt",
-        GENERATED_CERT_DIR,
+        generated_cert_dir,
         safe_host
     );
 
@@ -686,11 +770,17 @@ int cert_manager_get_or_create_leaf_certificate(
         key_path_size,
         _TRUNCATE,
         "%s\\%s.key",
-        GENERATED_CERT_DIR,
+        generated_cert_dir,
         safe_host
     );
 
-    if (cert_manager_file_exists(cert_path) && cert_manager_file_exists(key_path)) {
+    if (cert_manager_file_exists(cert_path) && cert_manager_file_exists(key_path) &&
+        cert_manager_cached_leaf_is_valid(
+            host,
+            cert_path,
+            key_path,
+            ca_cert_path
+        )) {
         log_info(
             "dynamic TLS leaf certificate cache hit. host=%s cert=%s key=%s",
             host,
@@ -701,10 +791,41 @@ int cert_manager_get_or_create_leaf_certificate(
         return 0;
     }
 
+    if (cert_manager_file_exists(cert_path) || cert_manager_file_exists(key_path)) {
+        log_warn(
+            "stale dynamic TLS leaf certificate rejected and will be regenerated. host=%s cert=%s key=%s",
+            host,
+            cert_path,
+            key_path
+        );
+    }
+
     log_info(
         "dynamic TLS leaf certificate cache miss. generating. host=%s",
         host
     );
 
     return cert_manager_create_leaf_certificate(host, cert_path, key_path);
+}
+
+int cert_manager_get_or_create_leaf_certificate(
+    const char* host,
+    char* cert_path,
+    int cert_path_size,
+    char* key_path,
+    int key_path_size
+)
+{
+    int result;
+
+    AcquireSRWLockExclusive(&g_certificate_generation_lock);
+    result = cert_manager_get_or_create_leaf_certificate_unlocked(
+        host,
+        cert_path,
+        cert_path_size,
+        key_path,
+        key_path_size
+    );
+    ReleaseSRWLockExclusive(&g_certificate_generation_lock);
+    return result;
 }

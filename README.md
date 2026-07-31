@@ -109,9 +109,16 @@ not match its declared extension is also blocked.
 
 At the default `INFO` log level, per-request HTTP headers, static assets,
 telemetry, Sentinel pings, TLS handshake details, session boundaries, and raw
-tunnel summaries are hidden. The normal upload trail is intentionally compact:
+tunnel summaries are hidden. Logs are separated by purpose:
+
+- `relay_events.log`: compact AI access, file upload, allow/block, and audit events.
+- `relay_runtime.log`: warnings and errors in deployment mode; verbose protocol
+  diagnostics only when `LOCAL_DLP_LOG_LEVEL=DEBUG` is explicitly enabled.
+
+The normal event trail is intentionally compact:
 
 ```text
+AI ACCESS        ... one entry-host event per browser process and 60-second window
 UPLOAD PREPARED  ... original file name and redacted storage target
 UPLOAD INSPECTED ... hash, detected format, extracted text bytes, ALLOW/BLOCK
 UPLOAD FORWARDED ... upstream status for an allowed upload
@@ -120,9 +127,42 @@ UPLOAD FORWARDED ... upstream status for an allowed upload
 Set `LOCAL_DLP_LOG_LEVEL=DEBUG` only while diagnosing protocol details. Signed
 upload URL query parameters are redacted at every log level.
 
+For an access-event-only pilot, leave discovery and body capture disabled. This
+mode records AI entry events but is not a file-blocking enforcement mode:
+
+```powershell
+$env:LOCAL_DLP_LOG_LEVEL = "INFO"
+Remove-Item Env:\LOCAL_DLP_DISCOVER_UPLOAD_HOSTS -ErrorAction SilentlyContinue
+Remove-Item Env:\LOCAL_DLP_CAPTURE_UPLOAD_BODIES -ErrorAction SilentlyContinue
+.\x64\Debug\relay_proxy.exe
+```
+
+The same production-safe defaults can be applied without inheriting old
+discovery or body-capture environment variables:
+
+```powershell
+.\relay_proxy\start_ai_dlp_info.bat
+```
+
+For preventive upload inspection and evidence storage, use the guarded launcher:
+
+```powershell
+.\relay_proxy\start_ai_dlp_capture.bat
+```
+
+It forces HTTP/1.1 so the full upload is inspected before any file byte is sent
+upstream, limits one request to 128 MiB and all concurrent HTTP/1 request
+buffers to 512 MiB, and routes only supported AI hosts through the PAC. Outlook,
+Microsoft 365, and every non-AI destination remain `DIRECT`.
+
+Upload-host discovery is a temporary engineering mode, not a production logging
+mode. It writes candidates only to the operational log and never to the compact
+AI event log.
+
 ChatGPT metadata requests are correlated with the later raw PUT to
-`*.oaiusercontent.com`, even when they use different TCP/TLS sessions. DOCX
-containers, PDF content streams, and ZIP entries are inspected in memory. ZIP
+`*.oaiusercontent.com`, even when they use different TCP/TLS sessions.
+DOCX/XLSX/PPTX/HWPX containers, rendered PDF pages, images, and nested ZIP
+entries are inspected in memory. ZIP
 path traversal, encrypted entries, excessive expansion, dangerous embedded
 extensions, active/embedded PDF content, and declared-format signature
 mismatches are blocked. Extracted document text is counted for policy use but is
@@ -183,7 +223,15 @@ relay_proxy\set_windows_proxy_127_0_0_1_8000.bat
 windows_browser_tools\open_browser_test_urls.bat
 ```
 
-After testing, remove the local proxy settings and trusted test CA:
+The Windows setup script uses an AI-only PAC file served by the local proxy.
+Only ChatGPT/OpenAI, Gemini, and Claude/Anthropic domains are routed through
+`127.0.0.1:8000`. Outlook, Microsoft 365, and all other applications use a
+direct connection and never enter the inspection proxy. The script refuses to
+change Windows settings unless the local PAC endpoint is available, and it
+backs up the existing WinINet settings before enabling the AI-only route.
+
+After testing, restore the previous Windows proxy settings and remove the
+trusted test CA:
 
 ```bat
 relay_proxy\unset_windows_proxy.bat
@@ -218,6 +266,11 @@ Supported rule types are intentionally limited to files:
 | --- | --- |
 | `FILE_UPLOAD` | Detect multipart file uploads |
 | `FILE_EXT` | Match uploaded file extensions |
+| `KEYWORD` | Match configured text after document extraction or OCR |
+| `EMAIL` | Detect email-address patterns |
+| `PHONE` | Detect Korean mobile-phone patterns |
+| `RESIDENT_ID` | Detect checksum/date-valid Korean resident IDs |
+| `CREDIT_CARD` | Detect Luhn-valid payment-card numbers |
 
 Example:
 
@@ -324,14 +377,12 @@ Rule format and example:
 chrome.exe confirmed-upload.example.com:443
 ```
 
-Then restart the proxy with body capture enabled:
+For a confirmed host, restart through the guarded capture launcher rather than
+starting the executable with inherited environment variables:
 
 ```powershell
-cd C:\Users\wodbs0101_global\source\repos\tcp_proxy_lab\relay_proxy
-
-$env:LOCAL_DLP_CAPTURE_UPLOAD_BODIES = "1"
-$env:LOCAL_DLP_CAPTURE_MAX_BYTES = "268435456"
-..\x64\Debug\relay_proxy.exe
+cd C:\path\to\tcp_proxy_lab
+.\relay_proxy\start_ai_dlp_capture.bat
 ```
 
 A matching entry forces MITM on the next connection unless the normal TLS
@@ -374,12 +425,29 @@ Windows Current User and Local Machine `ROOT` stores into its OpenSSL client
 context. Public upstream certificates therefore remain verified without using
 `LOCAL_DLP_ALLOW_INSECURE_UPSTREAM`.
 
-HTTPS MITM follows ALPN negotiation. `http/1.1` uses the HTTP/1.1 parser while
-`h2` uses HPACK header decoding, per-stream request reconstruction, DLP policy
-evaluation, audit logging, upstream `RST_STREAM`, and a local HTTP/2 403 block
-response. HTTP/2 file request bodies are inspected up to 32 MiB per active
-stream. A file larger than the complete inspection buffer is blocked rather
-than receiving a partial safety decision.
+HTTPS MITM automatically selects a common application protocol with ALPN. The
+browser ClientHello is paused after its offered protocol list is captured. The
+proxy offers only that supported intersection (`h2`, `http/1.1`) to the real
+server, observes the server's selection, and then completes the browser-side
+handshake with the exact same protocol. A server that omits ALPN is treated as
+HTTP/1.1. This prevents an `h2` browser leg from being paired with an
+HTTP/1.1-only upstream connection.
+
+`http/1.1` uses the HTTP/1.1 parser while `h2` uses HPACK header decoding,
+per-stream request reconstruction, DLP policy evaluation, audit logging,
+upstream `RST_STREAM`, and a local HTTP/2 403 block response. HTTP/2 file
+request bodies are inspected up to 32 MiB per active stream. A file larger than
+the complete inspection buffer is blocked rather than receiving a partial
+safety decision.
+
+For preventive browser testing, `start_ai_dlp_capture.bat` sets
+`LOCAL_DLP_FORCE_HTTP1_UPLOAD_INSPECTION=1`. The proxy negotiates HTTP/1.1 on
+both TLS legs, buffers the complete upload (up to the configured 512 MiB
+limit), inspects it, and only then forwards an ALLOW request. This is the mode
+that guarantees a blocked file has not already been sent upstream. With that
+variable disabled, ALPN automatically selects HTTP/1.1 or HTTP/2; the HTTP/2
+path reconstructs and records streams but must currently be treated as
+audit/capture rather than a zero-byte-leak preventive boundary.
 
 TLS itself is still normally TLS 1.2 or TLS 1.3. The HTTP application protocol
 is selected inside that handshake by ALPN: `http/1.1` selects the existing

@@ -12,6 +12,7 @@ static void make_safe_log_path(const char* path, char* output, size_t output_siz
 {
     const char* query;
     size_t length;
+    size_t index;
     if (output == NULL || output_size == 0) return;
     output[0] = '\0';
     if (path == NULL) return;
@@ -20,9 +21,11 @@ static void make_safe_log_path(const char* path, char* output, size_t output_siz
     if (length >= output_size) length = output_size - 1;
     memcpy(output, path, length);
     output[length] = '\0';
+    for (index = 0; index < length; ++index) {
+        unsigned char ch = (unsigned char)output[index];
+        if (ch < 0x20 || ch == 0x7f || ch == '"') output[index] = '_';
+    }
 }
-
-#define HTTP_HEADER_BUFFER_SIZE 8192
 
 static int find_header_end(const char* buffer, int length)
 {
@@ -242,7 +245,7 @@ int parse_http_request(const char* buffer, int length, http_request_t* request)
     int header_length;
     int body_length;
 
-    char header_copy[HTTP_HEADER_BUFFER_SIZE];
+    char* header_copy = NULL;
     char* line;
     char* context = NULL;
     int is_first_line = 1;
@@ -260,7 +263,21 @@ int parse_http_request(const char* buffer, int length, http_request_t* request)
 
     header_length = header_end;
 
-    if (header_length >= HTTP_HEADER_BUFFER_SIZE) {
+    if (header_length > HTTP_MAX_HEADER_SECTION_SIZE) {
+        log_warn(
+            "HTTP request header section exceeds limit. header_bytes=%d limit=%d",
+            header_length,
+            HTTP_MAX_HEADER_SECTION_SIZE
+        );
+        return 0;
+    }
+
+    header_copy = (char*)malloc((size_t)header_length + 1);
+    if (header_copy == NULL) {
+        log_error(
+            "failed to allocate HTTP request header parser buffer. header_bytes=%d",
+            header_length
+        );
         return 0;
     }
 
@@ -332,6 +349,7 @@ int parse_http_request(const char* buffer, int length, http_request_t* request)
         request->body_length = body_length;
     }
 
+    free(header_copy);
     return 1;
 }
 

@@ -99,6 +99,9 @@
     <ClCompile Include="file_analyzer.c">
       <Filter>소스 파일</Filter>
     </ClCompile>
+    <ClCompile Include="windows_ocr.cpp">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="socket_utils.h">
@@ -180,6 +183,9 @@
       <Filter>헤더 파일</Filter>
     </ClInclude>
     <ClInclude Include="file_analyzer.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
+    <ClInclude Include="windows_ocr.h">
       <Filter>헤더 파일</Filter>
     </ClInclude>
   </ItemGroup>

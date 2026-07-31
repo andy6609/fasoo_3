@@ -1,0 +1,7 @@
+LOCAL DLP SAFE UPLOAD TEST
+SERVICE: Claude
+TEST_ID: CLAUDE-SAFE-20260724
+CLASSIFICATION: NON-SENSITIVE TEST DATA
+EXPECTED_RESULT: ALLOW
+
+This file contains no company confidential information or personal data.

@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 
 #include <WinSock2.h>
 #include <Windows.h>
@@ -49,6 +50,10 @@
 #define HTTP2_FLAG_PRIORITY 0x20
 
 #define HTTP2_ERROR_CANCEL 0x8
+
+static volatile LONG g_request_analysis_bypass_reported = 0;
+static volatile LONG g_response_analysis_bypass_reported = 0;
+static __declspec(thread) int g_http2_expected_close = 0;
 
 static int http2_ssl_read_is_expected_close(
     SSL* ssl,
@@ -114,6 +119,7 @@ typedef struct http2_stream_state {
     int log_only_audited;
     int multipart_initial_inspected;
     upload_capture_writer_t capture;
+    upload_capture_view_t capture_view;
     int response_status;
     char response_content_type[HTTP_CONTENT_TYPE_SIZE];
     long long response_content_length;
@@ -137,6 +143,8 @@ typedef struct http2_parser {
     size_t header_block_length;
     unsigned int continuation_stream_id;
     unsigned char initial_headers_flags;
+    int analysis_disabled;
+    int analysis_failure_logged;
 } http2_parser_t;
 
 typedef struct http2_engine {
@@ -233,7 +241,30 @@ static int http2_ssl_write_all(SSL* ssl, const unsigned char* data, int length)
     while (total < length) {
         int written = SSL_write(ssl, data + total, length - total);
         if (written <= 0) {
-            log_error("HTTP/2 SSL_write() failed. ssl_error=%d", SSL_get_error(ssl, written));
+            int ssl_error = SSL_get_error(ssl, written);
+            int socket_error = WSAGetLastError();
+            unsigned long openssl_error = ERR_peek_error();
+            if (ssl_error == SSL_ERROR_ZERO_RETURN ||
+                (ssl_error == SSL_ERROR_SYSCALL &&
+                    (openssl_error == 0 ||
+                     socket_error == WSAECONNRESET ||
+                     socket_error == WSAECONNABORTED ||
+                     socket_error == WSAENOTCONN ||
+                     socket_error == WSAESHUTDOWN))) {
+                g_http2_expected_close = 1;
+                ERR_clear_error();
+                log_debug(
+                    "HTTP/2 peer closed during SSL_write. ssl_error=%d socket_error=%d",
+                    ssl_error,
+                    socket_error
+                );
+                return -1;
+            }
+            log_error(
+                "HTTP/2 SSL_write() failed. ssl_error=%d socket_error=%d",
+                ssl_error,
+                socket_error
+            );
             return -1;
         }
         total += written;
@@ -314,6 +345,7 @@ static void http2_release_stream(http2_stream_state_t* stream)
     }
 
     upload_capture_finish(&stream->capture, stream->request_complete);
+    upload_capture_close_view(&stream->capture_view);
     free(stream->body);
     free(stream->response_body);
     memset(stream, 0, sizeof(*stream));
@@ -501,7 +533,7 @@ static int http2_decode_header_block(
             1
         );
         if (consumed < 0) {
-            log_error(
+            log_debug(
                 "HTTP/2 HPACK decode failed. session_id=%lu direction=%s stream_id=%u error=%s",
                 engine->session->session_id,
                 parser->direction == HTTP2_DIRECTION_REQUEST ? "REQUEST" : "RESPONSE",
@@ -524,7 +556,7 @@ static int http2_decode_header_block(
             final_seen = 1;
         }
         if (consumed == 0 && !(inflate_flags & NGHTTP2_HD_INFLATE_EMIT) && !final_seen) {
-            log_error("HTTP/2 HPACK decoder made no progress. session_id=%lu stream_id=%u",
+            log_debug("HTTP/2 HPACK decoder made no progress. session_id=%lu stream_id=%u",
                 engine->session->session_id, stream_id);
             return -1;
         }
@@ -722,9 +754,15 @@ static int http2_send_block_response(
     return 0;
 }
 
-static dlp_result_t http2_inspect_request(http2_stream_state_t* stream, int end_stream)
+static dlp_result_t http2_inspect_request(
+    http2_engine_t* engine,
+    http2_stream_state_t* stream,
+    int end_stream
+)
 {
     dlp_result_t result;
+    const unsigned char* inspection_body;
+    size_t inspection_length;
 
     if (stream == NULL) {
         dlp_result_t empty;
@@ -732,12 +770,18 @@ static dlp_result_t http2_inspect_request(http2_stream_state_t* stream, int end_
         return empty;
     }
 
-    stream->request.body_data = (const char*)stream->body;
-    stream->request.body_data_length = (int)stream->body_length;
-    stream->request.body_length = (int)(stream->body_length < HTTP_BODY_SIZE - 1
-        ? stream->body_length : HTTP_BODY_SIZE - 1);
+    inspection_body = stream->capture_view.data != NULL
+        ? stream->capture_view.data : stream->body;
+    inspection_length = stream->capture_view.data != NULL
+        ? stream->capture_view.length : stream->body_length;
+    stream->request.body_data = inspection_length <= INT_MAX
+        ? (const char*)inspection_body : NULL;
+    stream->request.body_data_length = inspection_length <= INT_MAX
+        ? (int)inspection_length : 0;
+    stream->request.body_length = (int)(inspection_length < HTTP_BODY_SIZE - 1
+        ? inspection_length : HTTP_BODY_SIZE - 1);
     if (stream->request.body_length > 0) {
-        memcpy(stream->request.body, stream->body, stream->request.body_length);
+        memcpy(stream->request.body, inspection_body, stream->request.body_length);
     }
     stream->request.body[stream->request.body_length] = '\0';
 
@@ -757,7 +801,19 @@ static dlp_result_t http2_inspect_request(http2_stream_state_t* stream, int end_
     */
     if (!stream->multipart_initial_inspected || end_stream) {
         stream->multipart_initial_inspected = 1;
-        inspect_multipart_upload_request(&stream->request, &result);
+        if (end_stream) {
+            inspect_multipart_upload_request_with_context(
+                &stream->request,
+                &result,
+                engine != NULL ? engine->session : NULL,
+                NULL,
+                "h2",
+                stream->stream_id
+            );
+        }
+        else {
+            inspect_multipart_upload_request(&stream->request, &result);
+        }
     }
 
     return result;
@@ -770,26 +826,47 @@ static void http2_record_metadata_request(
 )
 {
     if (engine == NULL || stream == NULL || !end_stream || stream->metadata_upload_id != 0) return;
-    if (!upload_tracker_is_metadata_request(
+    if (upload_tracker_is_metadata_request(
         stream->request.method,
         stream->request.host,
         stream->request.path
-    )) return;
-
-    stream->metadata_upload_id = upload_tracker_record_metadata_request(
-        engine->session->session_id,
-        stream->stream_id,
-        (const char*)stream->body,
-        stream->body_length
-    );
+    )) {
+        stream->metadata_upload_id = upload_tracker_record_metadata_request(
+            engine->session->session_id,
+            stream->stream_id,
+            (const char*)stream->body,
+            stream->body_length
+        );
+    }
+    else {
+        stream->metadata_upload_id = upload_tracker_record_resumable_start(
+            engine->session->session_id,
+            stream->stream_id,
+            &stream->request,
+            (const char*)stream->body,
+            stream->body_length
+        );
+    }
 }
 
-static void http2_match_upload_tracking(http2_stream_state_t* stream)
+static void http2_match_upload_tracking(
+    http2_engine_t* engine,
+    http2_stream_state_t* stream
+)
 {
-    if (stream == NULL || stream->upload_tracking_matched ||
-        _stricmp(stream->request.method, "PUT") != 0 ||
+    if (engine == NULL || stream == NULL || stream->upload_tracking_matched ||
         !dlp_request_is_file_upload(&stream->request)) return;
 
+    stream->upload_tracking_matched = upload_tracker_match_resumable_finalize(
+        engine->session->session_id,
+        &stream->request,
+        stream->request.content_length > 0
+            ? (unsigned long long)stream->request.content_length
+            : stream->total_body_bytes,
+        &stream->upload_info
+    );
+    if (stream->upload_tracking_matched ||
+        _stricmp(stream->request.method, "PUT") != 0) return;
     stream->upload_tracking_matched = upload_tracker_match_raw_put(
         stream->request.host,
         stream->request.path,
@@ -810,25 +887,61 @@ static void http2_apply_file_analysis(
 {
     const char* filename;
     const char* action;
+    const unsigned char* file_body;
+    size_t file_body_length;
+    unsigned long long observed_length;
+    int original_complete;
+    http_request_t effective_request;
+    const http_request_t* record_request;
+    const char* effective_content_type;
     char sanitized_path[UPLOAD_TRACKER_PATH_SIZE];
 
     if (engine == NULL || stream == NULL || result == NULL || !end_stream ||
         stream->file_analysis_complete || !dlp_request_should_inspect(&stream->request)) return;
 
-    http2_match_upload_tracking(stream);
+    /* Multipart file parts are fully inspected by multipart_parser. Treating
+       the MIME envelope as one file creates misleading unknown-file events. */
+    if (strstr(stream->request.content_type, "multipart/form-data") != NULL) return;
+
+    http2_match_upload_tracking(engine, stream);
     filename = stream->upload_info.filename[0] ? stream->upload_info.filename : "unknown";
+    effective_request = stream->request;
+    if (stream->upload_info.content_type[0]) {
+        strncpy_s(effective_request.content_type, sizeof(effective_request.content_type),
+            stream->upload_info.content_type, _TRUNCATE);
+    }
+    record_request = &effective_request;
+    effective_content_type = record_request->content_type;
+    file_body = stream->capture_view.data != NULL
+        ? stream->capture_view.data : stream->body;
+    file_body_length = stream->capture_view.data != NULL
+        ? stream->capture_view.length : stream->body_length;
+    observed_length = stream->capture_view.reassembled
+        ? (unsigned long long)file_body_length
+        : (stream->capture.is_fragment && stream->capture.fragment_total_known
+            ? stream->capture.fragment_total : stream->total_body_bytes);
+    original_complete = stream->capture.is_fragment
+        ? stream->capture.reassembly_complete
+        : (stream->capture_view.data != NULL ||
+            stream->total_body_bytes == stream->body_length);
     memset(&stream->file_analysis, 0, sizeof(stream->file_analysis));
-    if (stream->total_body_bytes != stream->body_length) {
+    if (stream->capture.is_fragment && !stream->capture.reassembly_complete) {
+        stream->file_analysis.action = FILE_ANALYSIS_BLOCK;
+        strcpy_s(stream->file_analysis.format, sizeof(stream->file_analysis.format), "FRAGMENT");
+        strcpy_s(stream->file_analysis.reason, sizeof(stream->file_analysis.reason),
+            "resumable upload is incomplete; fail closed before upstream release");
+    }
+    else if (!original_complete) {
         stream->file_analysis.action = FILE_ANALYSIS_BLOCK;
         strcpy_s(stream->file_analysis.format, sizeof(stream->file_analysis.format), "TRUNCATED");
         strcpy_s(stream->file_analysis.reason, sizeof(stream->file_analysis.reason),
-            "file exceeds complete inspection buffer");
+            "complete upload body unavailable for inspection");
     }
     else if (file_analyzer_inspect(
         filename,
-        stream->request.content_type,
-        stream->body,
-        stream->body_length,
+        effective_content_type,
+        file_body,
+        file_body_length,
         &stream->file_analysis
     ) != 0) {
         stream->file_analysis.action = FILE_ANALYSIS_BLOCK;
@@ -836,25 +949,72 @@ static void http2_apply_file_analysis(
         strcpy_s(stream->file_analysis.reason, sizeof(stream->file_analysis.reason),
             "file analyzer failed");
     }
+    if (original_complete && stream->file_analysis.action != FILE_ANALYSIS_BLOCK) {
+        dlp_result_t content_policy = inspect_dlp_file_content(
+            filename,
+            effective_content_type,
+            file_body,
+            file_body_length,
+            &stream->file_analysis);
+        if (content_policy.action == DLP_ACTION_BLOCK) {
+            stream->file_analysis.action = FILE_ANALYSIS_BLOCK;
+            _snprintf_s(stream->file_analysis.reason,
+                sizeof(stream->file_analysis.reason), _TRUNCATE,
+                "content policy rule %d: %s", content_policy.matched_rule_id,
+                content_policy.reason[0] ? content_policy.reason : "blocked");
+            result->action = DLP_ACTION_BLOCK;
+            result->matched_rule_id = content_policy.matched_rule_id;
+            strncpy_s(result->keyword, sizeof(result->keyword),
+                content_policy.keyword[0] ? content_policy.keyword : "DOCUMENT_CONTENT", _TRUNCATE);
+            strncpy_s(result->reason, sizeof(result->reason),
+                stream->file_analysis.reason, _TRUNCATE);
+        }
+    }
     stream->file_analysis_complete = 1;
 
-    if (stream->file_analysis.action == FILE_ANALYSIS_BLOCK) {
+    if (upload_record_store_file_ex(
+        engine->session,
+        record_request,
+        NULL,
+        "h2",
+        stream->stream_id,
+        filename,
+        file_body,
+        file_body_length,
+        observed_length,
+        original_complete,
+        &stream->file_analysis
+    ) < 0) {
+        stream->file_analysis.action = FILE_ANALYSIS_BLOCK;
+        stream->file_analysis.extraction_complete = 0;
+        stream->file_analysis.extraction_status = FILE_EXTRACTION_PARTIAL;
+        strcpy_s(stream->file_analysis.reason, sizeof(stream->file_analysis.reason),
+            "upload evidence could not be stored; fail closed");
         result->action = DLP_ACTION_BLOCK;
-        result->matched_rule_id = 9001;
-        strncpy_s(result->keyword, sizeof(result->keyword), stream->file_analysis.format, _TRUNCATE);
-        strncpy_s(result->reason, sizeof(result->reason), stream->file_analysis.reason, _TRUNCATE);
+        result->matched_rule_id = 9300;
+        strcpy_s(result->keyword, sizeof(result->keyword), "AUDIT_STORAGE_FAILURE");
+        strcpy_s(result->reason, sizeof(result->reason), stream->file_analysis.reason);
+    }
+
+    if (stream->file_analysis.action == FILE_ANALYSIS_BLOCK) {
+        if (result->action != DLP_ACTION_BLOCK) {
+            result->action = DLP_ACTION_BLOCK;
+            result->matched_rule_id = 9001;
+            strncpy_s(result->keyword, sizeof(result->keyword), stream->file_analysis.format, _TRUNCATE);
+            strncpy_s(result->reason, sizeof(result->reason), stream->file_analysis.reason, _TRUNCATE);
+        }
     }
 
     action = stream->file_analysis.action == FILE_ANALYSIS_BLOCK ? "BLOCK" : "ALLOW";
     upload_tracker_sanitize_path(stream->request.path, sanitized_path, sizeof(sanitized_path));
-    log_info(
+    log_event(
         "UPLOAD INSPECTED id=%lu session=%lu stream=%u file=\"%s\" bytes=%llu type=%s format=%s entries=%u extracted_text_bytes=%llu sha256=%s action=%s reason=\"%s\" target=%s%s",
         stream->upload_info.upload_id,
         engine->session->session_id,
         stream->stream_id,
         filename,
         stream->total_body_bytes,
-        stream->request.content_type[0] ? stream->request.content_type : "unknown",
+        effective_content_type[0] ? effective_content_type : "unknown",
         stream->file_analysis.format[0] ? stream->file_analysis.format : "UNKNOWN",
         stream->file_analysis.archive_entries,
         stream->file_analysis.extracted_text_bytes,
@@ -879,7 +1039,7 @@ static void http2_finalize_response(http2_engine_t* engine, http2_stream_state_t
     }
 
     if (stream->file_analysis_complete) {
-        log_info(
+        log_event(
             "UPLOAD FORWARDED id=%lu session=%lu stream=%u file=\"%s\" upstream_status=%d",
             stream->upload_info.upload_id,
             engine->session->session_id,
@@ -902,7 +1062,7 @@ static int http2_evaluate_request(
         return stream != NULL && stream->blocked ? 1 : -1;
     }
 
-    result = http2_inspect_request(stream, end_stream);
+    result = http2_inspect_request(engine, stream, end_stream);
     http2_record_metadata_request(engine, stream, end_stream);
     http2_apply_file_analysis(engine, stream, end_stream, &result);
     if (result.action == DLP_ACTION_BLOCK) {
@@ -983,6 +1143,27 @@ static int http2_process_frame(
     int header_block_completed = 0;
     int request_end_stream = 0;
 
+    if (parser->analysis_disabled) {
+        int forward_result = http2_forward_raw_frame(
+            engine,
+            parser->direction,
+            frame,
+            frame_length
+        );
+
+        if (forward_result == 0 && parser->direction == HTTP2_DIRECTION_RESPONSE &&
+            stream_id != 0 &&
+            (((flags & HTTP2_FLAG_END_STREAM) != 0) || type == HTTP2_FRAME_RST_STREAM)) {
+            http2_stream_state_t* completed = http2_find_stream(engine, stream_id, 0);
+            if (completed != NULL) {
+                http2_finalize_response(engine, completed);
+                completed->response_complete = 1;
+                http2_release_stream(completed);
+            }
+        }
+        return forward_result;
+    }
+
     log_debug(
         "HTTP2_FRAME session_id=%lu direction=%s type=0x%02x stream_id=%u flags=0x%02x payload_bytes=%u",
         engine->session->session_id,
@@ -1007,7 +1188,29 @@ static int http2_process_frame(
             payload,
             payload_length
         ) != 0) {
-            return -1;
+            parser->analysis_disabled = 1;
+            parser->header_block_length = 0;
+            parser->continuation_stream_id = 0;
+            if (!parser->analysis_failure_logged) {
+                volatile LONG* reported = parser->direction == HTTP2_DIRECTION_REQUEST
+                    ? &g_request_analysis_bypass_reported
+                    : &g_response_analysis_bypass_reported;
+                parser->analysis_failure_logged = 1;
+                if (InterlockedCompareExchange(reported, 1, 0) == 0) {
+                    log_warn(
+                        "AI_ANALYSIS_BYPASS direction=%s reason=hpack_decode_failed transport_continues=true dlp_direction_disabled=true subsequent_occurrences=debug_only",
+                        parser->direction == HTTP2_DIRECTION_REQUEST ? "REQUEST" : "RESPONSE"
+                    );
+                }
+                else {
+                    log_debug(
+                        "AI_ANALYSIS_BYPASS session_id=%lu direction=%s reason=hpack_decode_failed transport_continues=true dlp_direction_disabled=true",
+                        engine->session->session_id,
+                        parser->direction == HTTP2_DIRECTION_REQUEST ? "REQUEST" : "RESPONSE"
+                    );
+                }
+            }
+            return http2_forward_raw_frame(engine, parser->direction, frame, frame_length);
         }
         request_end_stream = header_block_completed &&
             ((header_start_flags & HTTP2_FLAG_END_STREAM) != 0);
@@ -1040,6 +1243,17 @@ static int http2_process_frame(
             }
             if ((flags & HTTP2_FLAG_END_STREAM) != 0) {
                 upload_capture_finish(&stream->capture, 1);
+                if (upload_capture_open_complete_view(
+                    &stream->capture,
+                    &stream->capture_view
+                ) < 0) {
+                    log_warn(
+                        "HTTP/2 complete upload capture could not be mapped. session_id=%lu stream_id=%u file=\"%s\"",
+                        engine->session->session_id,
+                        stream->stream_id,
+                        stream->capture.file_path
+                    );
+                }
             }
 
             if (http2_append_body(stream, body, body_length) != 0) {
@@ -1235,6 +1449,8 @@ int http2_engine_relay_loop(
         return -1;
     }
 
+    g_http2_expected_close = 0;
+
     engine = (http2_engine_t*)calloc(1, sizeof(*engine));
     if (engine == NULL) return -1;
     engine->session = session;
@@ -1255,29 +1471,44 @@ int http2_engine_relay_loop(
         fd_set read_fds;
         struct timeval timeout;
         int select_result;
-        int client_ready = SSL_pending(client_ssl) > 0;
-        int upstream_ready = SSL_pending(upstream_ssl) > 0;
+        int client_pending = SSL_pending(client_ssl) > 0;
+        int upstream_pending = SSL_pending(upstream_ssl) > 0;
+        int client_ready;
+        int upstream_ready;
 
-        if (!client_ready && !upstream_ready) {
-            FD_ZERO(&read_fds);
-            FD_SET(session->client_sock, &read_fds);
-            FD_SET(upstream_sock, &read_fds);
+        /*
+         * Always poll both sockets, even when one SSL object already has
+         * decrypted bytes buffered. Skipping select() while client data was
+         * pending could starve upstream responses during a burst of
+         * multiplexed browser requests.
+         */
+        FD_ZERO(&read_fds);
+        FD_SET(session->client_sock, &read_fds);
+        FD_SET(upstream_sock, &read_fds);
+
+        if (client_pending || upstream_pending) {
+            timeout.tv_sec = 0;
+            timeout.tv_usec = 0;
+        }
+        else {
             timeout.tv_sec = 300;
             timeout.tv_usec = 0;
-
-            select_result = select(0, &read_fds, NULL, NULL, &timeout);
-            if (select_result == SOCKET_ERROR) {
-                result = -1;
-                break;
-            }
-            if (select_result == 0) {
-                log_info("TLS MITM HTTP/2 idle timeout. session_id=%lu", session->session_id);
-                break;
-            }
-
-            client_ready = FD_ISSET(session->client_sock, &read_fds) != 0;
-            upstream_ready = FD_ISSET(upstream_sock, &read_fds) != 0;
         }
+
+        select_result = select(0, &read_fds, NULL, NULL, &timeout);
+        if (select_result == SOCKET_ERROR) {
+            result = -1;
+            break;
+        }
+        if (select_result == 0 && !client_pending && !upstream_pending) {
+            log_info("TLS MITM HTTP/2 idle timeout. session_id=%lu", session->session_id);
+            break;
+        }
+
+        client_ready = client_pending ||
+            (select_result > 0 && FD_ISSET(session->client_sock, &read_fds));
+        upstream_ready = upstream_pending ||
+            (select_result > 0 && FD_ISSET(upstream_sock, &read_fds));
 
         if (client_ready) {
             int read_length = SSL_read(client_ssl, buffer, sizeof(buffer));
@@ -1286,9 +1517,9 @@ int http2_engine_relay_loop(
                 int socket_error = 0;
 
                 if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
-                    continue;
+                    client_ready = 0;
                 }
-                if (http2_ssl_read_is_expected_close(
+                else if (http2_ssl_read_is_expected_close(
                     client_ssl,
                     read_length,
                     ssl_error,
@@ -1302,15 +1533,19 @@ int http2_engine_relay_loop(
                     );
                     break;
                 }
-                log_error("HTTP/2 client SSL_read failed. session_id=%lu ssl_error=%d socket_error=%d",
-                    session->session_id, ssl_error, socket_error);
-                result = -1;
-                break;
+                else {
+                    log_error("HTTP/2 client SSL_read failed. session_id=%lu ssl_error=%d socket_error=%d",
+                        session->session_id, ssl_error, socket_error);
+                    result = -1;
+                    break;
+                }
             }
-            session_context_add_bytes_from_client(session, read_length);
-            if (http2_parser_feed(engine, &engine->request_parser, buffer, read_length) != 0) {
-                result = -1;
-                break;
+            else {
+                session_context_add_bytes_from_client(session, read_length);
+                if (http2_parser_feed(engine, &engine->request_parser, buffer, read_length) != 0) {
+                    result = g_http2_expected_close ? 0 : -1;
+                    break;
+                }
             }
         }
 
@@ -1321,9 +1556,9 @@ int http2_engine_relay_loop(
                 int socket_error = 0;
 
                 if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
-                    continue;
+                    upstream_ready = 0;
                 }
-                if (http2_ssl_read_is_expected_close(
+                else if (http2_ssl_read_is_expected_close(
                     upstream_ssl,
                     read_length,
                     ssl_error,
@@ -1337,15 +1572,19 @@ int http2_engine_relay_loop(
                     );
                     break;
                 }
-                log_error("HTTP/2 upstream SSL_read failed. session_id=%lu ssl_error=%d socket_error=%d",
-                    session->session_id, ssl_error, socket_error);
-                result = -1;
-                break;
+                else {
+                    log_error("HTTP/2 upstream SSL_read failed. session_id=%lu ssl_error=%d socket_error=%d",
+                        session->session_id, ssl_error, socket_error);
+                    result = -1;
+                    break;
+                }
             }
-            session_context_add_bytes_from_upstream(session, read_length);
-            if (http2_parser_feed(engine, &engine->response_parser, buffer, read_length) != 0) {
-                result = -1;
-                break;
+            else {
+                session_context_add_bytes_from_upstream(session, read_length);
+                if (http2_parser_feed(engine, &engine->response_parser, buffer, read_length) != 0) {
+                    result = g_http2_expected_close ? 0 : -1;
+                    break;
+                }
             }
         }
     }

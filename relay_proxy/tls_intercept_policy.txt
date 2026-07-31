@@ -31,11 +31,33 @@ brave.exe chatgpt.com:443 MITM ai_file_upload_only
 brave.exe *.openai.com:443 MITM ai_file_upload_only
 brave.exe *.oaiusercontent.com:443 MITM ai_file_upload_only
 
+# Fail-safe host-only fallback: process attribution can race with short-lived
+# browser sockets. PAC routing is already AI-only, so an unknown process must
+# not turn a configured AI upload into an encrypted bypass.
+chatgpt.com:443 MITM ai_file_upload_process_fallback
+*.chatgpt.com:443 MITM ai_file_upload_process_fallback
+openai.com:443 MITM ai_file_upload_process_fallback
+*.openai.com:443 MITM ai_file_upload_process_fallback
+oaiusercontent.com:443 MITM ai_file_upload_process_fallback
+*.oaiusercontent.com:443 MITM ai_file_upload_process_fallback
+
 # Google Gemini. Other Google services remain raw and uninspected.
 chrome.exe gemini.google.com:443 MITM ai_file_upload_only
+chrome.exe content-push.googleapis.com:443 MITM ai_file_upload_only
+chrome.exe generativelanguage.googleapis.com:443 MITM ai_file_upload_only
 msedge.exe gemini.google.com:443 MITM ai_file_upload_only
+msedge.exe content-push.googleapis.com:443 MITM ai_file_upload_only
+msedge.exe generativelanguage.googleapis.com:443 MITM ai_file_upload_only
 firefox.exe gemini.google.com:443 MITM ai_file_upload_only
+firefox.exe content-push.googleapis.com:443 MITM ai_file_upload_only
+firefox.exe generativelanguage.googleapis.com:443 MITM ai_file_upload_only
 brave.exe gemini.google.com:443 MITM ai_file_upload_only
+brave.exe content-push.googleapis.com:443 MITM ai_file_upload_only
+brave.exe generativelanguage.googleapis.com:443 MITM ai_file_upload_only
+
+gemini.google.com:443 MITM ai_file_upload_process_fallback
+content-push.googleapis.com:443 MITM ai_file_upload_process_fallback
+generativelanguage.googleapis.com:443 MITM ai_file_upload_process_fallback
 
 # Anthropic Claude
 chrome.exe claude.ai:443 MITM ai_file_upload_only
@@ -46,6 +68,11 @@ firefox.exe claude.ai:443 MITM ai_file_upload_only
 firefox.exe *.anthropic.com:443 MITM ai_file_upload_only
 brave.exe claude.ai:443 MITM ai_file_upload_only
 brave.exe *.anthropic.com:443 MITM ai_file_upload_only
+
+claude.ai:443 MITM ai_file_upload_process_fallback
+*.claude.ai:443 MITM ai_file_upload_process_fallback
+anthropic.com:443 MITM ai_file_upload_process_fallback
+*.anthropic.com:443 MITM ai_file_upload_process_fallback
 
 # All non-AI sites, desktop applications, authentication services, browser
 # background traffic, and unknown destinations pass through without decryption.

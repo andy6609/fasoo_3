@@ -145,7 +145,9 @@
     <ClCompile Include="mitm_target_policy.c" />
     <ClCompile Include="multipart_parser.c" />
     <ClCompile Include="pattern_detector.c" />
-    <ClCompile Include="policy_engine.c" />
+    <ClCompile Include="policy_engine.c">
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
     <ClCompile Include="process_metadata.c" />
     <ClCompile Include="relay_proxy.c" />
     <ClCompile Include="request_buffer.c" />
@@ -157,6 +159,10 @@
     <ClCompile Include="upload_capture.c" />
     <ClCompile Include="upload_tracker.c" />
     <ClCompile Include="upstream_resolver.c" />
+    <ClCompile Include="windows_ocr.cpp">
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="audit_log.h" />
@@ -186,9 +192,12 @@
     <ClInclude Include="upload_capture.h" />
     <ClInclude Include="upload_tracker.h" />
     <ClInclude Include="upstream_resolver.h" />
+    <ClInclude Include="windows_ocr.h" />
   </ItemGroup>
   <ItemGroup>
+    <None Include="ai_only_proxy.pac" />
     <None Include="upload_capture_hosts.txt" />
+    <None Include="windows_ai_proxy.ps1" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

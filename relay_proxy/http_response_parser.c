@@ -8,8 +8,6 @@
 #include "http_response_parser.h"
 #include "logger.h"
 
-#define HTTP_RESPONSE_HEADER_BUFFER_SIZE 8192
-
 static int find_header_end(const char* buffer, int length)
 {
     int i;
@@ -438,7 +436,7 @@ int parse_http_response(const char* buffer, int length, http_response_t* respons
     int header_length;
     int raw_body_length;
 
-    char header_copy[HTTP_RESPONSE_HEADER_BUFFER_SIZE];
+    char* header_copy = NULL;
     char* line;
     char* context = NULL;
     int is_first_line = 1;
@@ -456,7 +454,21 @@ int parse_http_response(const char* buffer, int length, http_response_t* respons
 
     header_length = header_end;
 
-    if (header_length >= HTTP_RESPONSE_HEADER_BUFFER_SIZE) {
+    if (header_length > HTTP_MAX_HEADER_SECTION_SIZE) {
+        log_warn(
+            "HTTP response header section exceeds limit. header_bytes=%d limit=%d",
+            header_length,
+            HTTP_MAX_HEADER_SECTION_SIZE
+        );
+        return 0;
+    }
+
+    header_copy = (char*)malloc((size_t)header_length + 1);
+    if (header_copy == NULL) {
+        log_error(
+            "failed to allocate HTTP response header parser buffer. header_bytes=%d",
+            header_length
+        );
         return 0;
     }
 
@@ -549,6 +561,7 @@ int parse_http_response(const char* buffer, int length, http_response_t* respons
         }
     }
 
+    free(header_copy);
     return 1;
 }
 

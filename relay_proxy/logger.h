@@ -11,5 +11,6 @@ void log_info(const char* format, ...);
 void log_warn(const char* format, ...);
 void log_error(const char* format, ...);
 void log_security(const char* format, ...);
+void log_event(const char* format, ...);
 
 #endif

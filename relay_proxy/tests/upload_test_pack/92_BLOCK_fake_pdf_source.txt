@@ -1,0 +1,4 @@
+LOCAL DLP SIGNATURE MISMATCH TEST
+TEST_ID: BLOCK-FAKE-PDF-20260724
+EXPECTED_RESULT: BLOCK
+This is intentionally plain text that will be copied with a .pdf extension.

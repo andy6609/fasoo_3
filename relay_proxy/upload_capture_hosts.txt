@@ -12,3 +12,54 @@
 #
 # Capturing is disabled unless LOCAL_DLP_CAPTURE_UPLOAD_BODIES=1 is set.
 # A matching entry forces MITM for that browser/host on the next connection.
+
+# ChatGPT / OpenAI uploads
+chrome.exe chatgpt.com:443
+chrome.exe *.openai.com:443
+chrome.exe *.oaiusercontent.com:443
+msedge.exe chatgpt.com:443
+msedge.exe *.openai.com:443
+msedge.exe *.oaiusercontent.com:443
+firefox.exe chatgpt.com:443
+firefox.exe *.openai.com:443
+firefox.exe *.oaiusercontent.com:443
+brave.exe chatgpt.com:443
+brave.exe *.openai.com:443
+brave.exe *.oaiusercontent.com:443
+* chatgpt.com:443
+* *.chatgpt.com:443
+* openai.com:443
+* *.openai.com:443
+* oaiusercontent.com:443
+* *.oaiusercontent.com:443
+
+# Gemini web and upload APIs. Other Google services remain excluded.
+chrome.exe gemini.google.com:443
+chrome.exe content-push.googleapis.com:443
+chrome.exe generativelanguage.googleapis.com:443
+msedge.exe gemini.google.com:443
+msedge.exe content-push.googleapis.com:443
+msedge.exe generativelanguage.googleapis.com:443
+firefox.exe gemini.google.com:443
+firefox.exe content-push.googleapis.com:443
+firefox.exe generativelanguage.googleapis.com:443
+brave.exe gemini.google.com:443
+brave.exe content-push.googleapis.com:443
+brave.exe generativelanguage.googleapis.com:443
+* gemini.google.com:443
+* content-push.googleapis.com:443
+* generativelanguage.googleapis.com:443
+
+# Claude / Anthropic uploads
+chrome.exe claude.ai:443
+chrome.exe *.anthropic.com:443
+msedge.exe claude.ai:443
+msedge.exe *.anthropic.com:443
+firefox.exe claude.ai:443
+firefox.exe *.anthropic.com:443
+brave.exe claude.ai:443
+brave.exe *.anthropic.com:443
+* claude.ai:443
+* *.claude.ai:443
+* anthropic.com:443
+* *.anthropic.com:443

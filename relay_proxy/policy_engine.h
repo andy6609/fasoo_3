@@ -19,5 +19,9 @@ int policy_engine_reload(const char* policy_file_path);
 void policy_engine_cleanup(void);
 
 policy_result_t inspect_policy_text(const char* data, int length);
+/* Inspect text already extracted from a document or OCR result. File-envelope
+ * rules are skipped so a generic FILE_UPLOAD log rule cannot hide a content
+ * BLOCK rule. */
+policy_result_t inspect_policy_document_text(const char* data, int length);
 
 #endif

@@ -9,6 +9,7 @@
 #include "logger.h"
 
 static FILE* g_log_file = NULL;
+static FILE* g_event_file = NULL;
 static CRITICAL_SECTION g_log_lock;
 static int g_logger_ready = 0;
 static int g_debug_enabled = 0;
@@ -95,7 +96,9 @@ static int logger_info_is_verbose_diagnostic(const char* format)
 int logger_init(const char* log_file_path)
 {
     char level[32];
+    char event_path[MAX_PATH];
     size_t level_size = 0;
+    size_t event_path_size = 0;
 
     if (log_file_path == NULL) {
         return -1;
@@ -110,14 +113,28 @@ int logger_init(const char* log_file_path)
         return -1;
     }
 
-    printf("[LOGGER] log file opened: %s\n", log_file_path);
+    event_path[0] = '\0';
+    if (getenv_s(
+        &event_path_size,
+        event_path,
+        sizeof(event_path),
+        "LOCAL_DLP_EVENT_LOG_PATH"
+    ) != 0 || event_path_size == 0) {
+        strcpy_s(event_path, sizeof(event_path), "relay_events.log");
+    }
+    g_event_file = fopen(event_path, "a");
+    if (g_event_file == NULL) {
+        printf("[LOGGER] failed to open AI event log: %s\n", event_path);
+    }
 
     level[0] = '\0';
     if (getenv_s(&level_size, level, sizeof(level), "LOCAL_DLP_LOG_LEVEL") == 0 &&
         level_size > 0 && _stricmp(level, "DEBUG") == 0) {
         g_debug_enabled = 1;
     }
-    printf("[LOGGER] level: %s (set LOCAL_DLP_LOG_LEVEL=DEBUG for verbose diagnostics)\n",
+    printf("[LOGGER] operational=%s events=%s level=%s\n",
+        log_file_path,
+        event_path,
         g_debug_enabled ? "DEBUG" : "INFO");
 
     return 0;
@@ -134,6 +151,11 @@ void logger_close(void)
         g_log_file = NULL;
     }
 
+    if (g_event_file != NULL) {
+        fclose(g_event_file);
+        g_event_file = NULL;
+    }
+
     if (g_logger_ready) {
         LeaveCriticalSection(&g_log_lock);
         DeleteCriticalSection(&g_log_lock);
@@ -141,7 +163,13 @@ void logger_close(void)
     }
 }
 
-static void log_write(const char* level, const char* format, va_list args)
+static void log_write(
+    const char* level,
+    const char* format,
+    va_list args,
+    int console_visible,
+    int event_visible
+)
 {
     time_t now;
     struct tm local_time;
@@ -174,11 +202,20 @@ static void log_write(const char* level, const char* format, va_list args)
         message_buffer
     );
 
-    logger_write_console_utf8(line_buffer);
+    if (console_visible || g_debug_enabled) {
+        logger_write_console_utf8(line_buffer);
+    }
 
-    if (g_log_file != NULL) {
+    /* Business/security events live only in the compact event log. */
+    if (!event_visible && g_log_file != NULL) {
         fputs(line_buffer, g_log_file);
         fflush(g_log_file);
+    }
+
+
+    if (event_visible && g_event_file != NULL) {
+        fputs(line_buffer, g_event_file);
+        fflush(g_event_file);
     }
 
     if (g_logger_ready) {
@@ -194,7 +231,7 @@ void log_debug(const char* format, ...)
         return;
     }
     va_start(args, format);
-    log_write("DEBUG", format, args);
+    log_write("DEBUG", format, args, 0, 0);
     va_end(args);
 }
 
@@ -202,12 +239,13 @@ void log_info(const char* format, ...)
 {
     va_list args;
 
-    if (logger_info_is_verbose_diagnostic(format) && !g_debug_enabled) {
+    /* INFO mode is deployment-quiet; operational INFO is a DEBUG concern. */
+    if (!g_debug_enabled) {
         return;
     }
 
     va_start(args, format);
-    log_write(logger_info_is_verbose_diagnostic(format) ? "DEBUG" : "INFO", format, args);
+    log_write(logger_info_is_verbose_diagnostic(format) ? "DEBUG" : "INFO", format, args, 0, 0);
     va_end(args);
 }
 
@@ -215,7 +253,7 @@ void log_warn(const char* format, ...)
 {
     va_list args;
     va_start(args, format);
-    log_write("WARN", format, args);
+    log_write("WARN", format, args, 1, 0);
     va_end(args);
 }
 
@@ -223,7 +261,7 @@ void log_error(const char* format, ...)
 {
     va_list args;
     va_start(args, format);
-    log_write("ERROR", format, args);
+    log_write("ERROR", format, args, 1, 0);
     va_end(args);
 }
 
@@ -231,7 +269,15 @@ void log_security(const char* format, ...)
 {
     va_list args;
     va_start(args, format);
-    log_write("SECURITY", format, args);
+    log_write("SECURITY", format, args, 1, 1);
+    va_end(args);
+}
+
+void log_event(const char* format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    log_write("EVENT", format, args, 1, 1);
     va_end(args);
 }
 

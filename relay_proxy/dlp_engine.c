@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 
 #include "dlp_engine.h"
 #include "policy_engine.h"
@@ -20,6 +21,26 @@ static dlp_result_t make_dlp_allow_result(void)
     result.action = DLP_ACTION_ALLOW;
     result.matched_rule_id = 0;
 
+    return result;
+}
+
+static int dlp_env_flag_enabled(const char* name)
+{
+    const char* value = getenv(name);
+    return value != NULL && value[0] != '\0' &&
+        _stricmp(value, "0") != 0 && _stricmp(value, "false") != 0 &&
+        _stricmp(value, "no") != 0 && _stricmp(value, "off") != 0;
+}
+
+static dlp_result_t make_unscannable_block_result(const char* reason)
+{
+    dlp_result_t result = make_dlp_allow_result();
+    result.action = DLP_ACTION_BLOCK;
+    result.matched_rule_id = 9200;
+    strncpy_s(result.keyword, sizeof(result.keyword), "UNSCANNABLE", _TRUNCATE);
+    strncpy_s(result.reason, sizeof(result.reason),
+        reason != NULL && reason[0] != '\0' ? reason : "uploaded file could not be inspected",
+        _TRUNCATE);
     return result;
 }
 
@@ -113,6 +134,14 @@ int dlp_request_is_file_upload(const http_request_t* request)
         return 0;
     }
 
+    /* A truncated header set may have dropped Content-Disposition or a
+       resumable-upload command.  On an intercepted AI host, treat such a
+       state-changing request as an upload candidate so it is inspected or
+       blocked instead of silently bypassed. */
+    if (request->headers_truncated) {
+        return 1;
+    }
+
     if (contains_text_ignore_case(request->content_type, "multipart/form-data")) {
         return 1;
     }
@@ -123,6 +152,15 @@ int dlp_request_is_file_upload(const http_request_t* request)
     }
 
     if (content_type_is_file_payload(request->content_type)) {
+        return 1;
+    }
+
+    /* Gemini resumable uploads use a protocol content type such as
+       application/x-www-form-urlencoded even though the upload/finalize
+       request body is the raw file. The command header is the authoritative
+       structural signal; the preceding start request contains metadata only. */
+    if (request_header_contains(request, "X-Goog-Upload-Command", "upload") ||
+        request_header_contains(request, "X-Goog-Upload-Command", "finalize")) {
         return 1;
     }
 
@@ -339,4 +377,53 @@ dlp_result_t inspect_dlp_response(const http_response_t* response)
 {
     (void)response;
     return make_dlp_allow_result();
+}
+
+dlp_result_t inspect_dlp_file_content(
+    const char* filename,
+    const char* content_type,
+    const unsigned char* data,
+    size_t length,
+    const file_analysis_result_t* analysis)
+{
+    char* extracted = NULL;
+    size_t extracted_length = 0;
+    int truncated = 0;
+    int extract_result;
+    policy_result_t policy_result;
+
+    if (data == NULL || length == 0) {
+        return dlp_env_flag_enabled("LOCAL_DLP_BLOCK_UNSCANNABLE")
+            ? make_unscannable_block_result("empty uploaded file cannot be inspected")
+            : make_dlp_allow_result();
+    }
+
+    if (analysis != NULL && !analysis->extraction_complete &&
+        dlp_env_flag_enabled("LOCAL_DLP_BLOCK_UNSCANNABLE")) {
+        return make_unscannable_block_result(
+            analysis->reason[0] != '\0' ? analysis->reason : "file format is not fully scannable");
+    }
+
+    extract_result = file_analyzer_extract_text(
+        filename, content_type, data, length,
+        &extracted, &extracted_length, &truncated);
+    if (extract_result != 0) {
+        return dlp_env_flag_enabled("LOCAL_DLP_BLOCK_UNSCANNABLE")
+            ? make_unscannable_block_result("document text extraction failed")
+            : make_dlp_allow_result();
+    }
+    if (truncated && dlp_env_flag_enabled("LOCAL_DLP_BLOCK_UNSCANNABLE")) {
+        free(extracted);
+        return make_unscannable_block_result("extracted document text exceeded inspection limit");
+    }
+    if (extracted == NULL || extracted_length == 0) {
+        free(extracted);
+        return make_dlp_allow_result();
+    }
+
+    policy_result = inspect_policy_document_text(
+        extracted,
+        extracted_length > (size_t)INT_MAX ? INT_MAX : (int)extracted_length);
+    free(extracted);
+    return convert_policy_result_to_dlp_result(policy_result);
 }

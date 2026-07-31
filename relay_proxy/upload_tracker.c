@@ -15,6 +15,7 @@
 typedef struct upload_tracker_entry {
     int in_use;
     int matched;
+    int resumable;
     unsigned long upload_id;
     unsigned long metadata_session_id;
     unsigned int metadata_stream_id;
@@ -32,6 +33,28 @@ static int text_equals_ignore_case(const char* left, const char* right)
     return left != NULL && right != NULL && _stricmp(left, right) == 0;
 }
 
+static const char* request_header_value(const http_request_t* request, const char* name)
+{
+    int i;
+    if (request == NULL || name == NULL) return NULL;
+    for (i = 0; i < request->header_count; i++) {
+        if (_stricmp(request->headers[i].name, name) == 0) return request->headers[i].value;
+    }
+    return NULL;
+}
+
+static int text_contains_ignore_case(const char* value, const char* needle)
+{
+    size_t needle_length;
+    const char* cursor;
+    if (value == NULL || needle == NULL || needle[0] == '\0') return 0;
+    needle_length = strlen(needle);
+    for (cursor = value; *cursor != '\0'; cursor++) {
+        if (_strnicmp(cursor, needle, needle_length) == 0) return 1;
+    }
+    return 0;
+}
+
 static int host_equals_or_is_subdomain(const char* host, const char* suffix)
 {
     size_t host_length;
@@ -43,6 +66,31 @@ static int host_equals_or_is_subdomain(const char* host, const char* suffix)
     if (host_length == suffix_length && _strnicmp(host, suffix, suffix_length) == 0) return 1;
     return host_length > suffix_length && host[host_length - suffix_length - 1] == '.' &&
         _strnicmp(host + host_length - suffix_length, suffix, suffix_length) == 0;
+}
+
+static void sanitize_filename_in_place(char* value, size_t capacity)
+{
+    char cleaned[UPLOAD_TRACKER_FILENAME_SIZE];
+    const char* base;
+    const char* slash;
+    const char* backslash;
+    size_t input;
+    size_t output = 0;
+    if (value == NULL || capacity == 0) return;
+    base = value;
+    slash = strrchr(value, '/');
+    backslash = strrchr(value, '\\');
+    if (slash != NULL && slash + 1 > base) base = slash + 1;
+    if (backslash != NULL && backslash + 1 > base) base = backslash + 1;
+    for (input = 0; base[input] != '\0' && output + 1 < sizeof(cleaned); ++input) {
+        unsigned char ch = (unsigned char)base[input];
+        if (ch < 0x20 || ch == 0x7f) cleaned[output++] = '_';
+        else if (ch == '"') cleaned[output++] = '\'';
+        else cleaned[output++] = (char)ch;
+    }
+    if (output == 0) strcpy_s(cleaned, sizeof(cleaned), "unknown");
+    else cleaned[output] = '\0';
+    strncpy_s(value, capacity, cleaned, _TRUNCATE);
 }
 
 static int hex_value(char ch)
@@ -177,6 +225,7 @@ static int json_extract_u64(
 
 void upload_tracker_sanitize_path(const char* path, char* sanitized, size_t sanitized_size)
 {
+    size_t index;
     size_t length;
     const char* query;
 
@@ -188,6 +237,10 @@ void upload_tracker_sanitize_path(const char* path, char* sanitized, size_t sani
     if (length >= sanitized_size) length = sanitized_size - 1;
     memcpy(sanitized, path, length);
     sanitized[length] = '\0';
+    for (index = 0; index < length; ++index) {
+        unsigned char ch = (unsigned char)sanitized[index];
+        if (ch < 0x20 || ch == 0x7f || ch == '"') sanitized[index] = '_';
+    }
 }
 
 static void parse_upload_url(const char* url, char* host, size_t host_size, char* path, size_t path_size)
@@ -285,6 +338,7 @@ unsigned long upload_tracker_record_metadata_request(
     entry->created_tick = GetTickCount64();
     entry->metadata_session_id = session_id;
     entry->metadata_stream_id = stream_id;
+    entry->resumable = 0;
     entry->upload_id = g_next_upload_id++;
     if (g_next_upload_id == 0) g_next_upload_id = 1;
 
@@ -299,10 +353,115 @@ unsigned long upload_tracker_record_metadata_request(
     if (!json_extract_u64(body, body_length, "file_size", &entry->info.declared_size)) {
         json_extract_u64(body, body_length, "size", &entry->info.declared_size);
     }
+    sanitize_filename_in_place(entry->info.filename, sizeof(entry->info.filename));
     entry->info.upload_id = entry->upload_id;
     upload_id = entry->upload_id;
     LeaveCriticalSection(&g_lock);
     return upload_id;
+}
+
+unsigned long upload_tracker_record_resumable_start(
+    unsigned long session_id,
+    unsigned int stream_id,
+    const http_request_t* request,
+    const char* body,
+    size_t body_length
+)
+{
+    static const char prefix[] = "File name: ";
+    const char* command;
+    const char* declared_type;
+    const char* declared_size;
+    upload_tracker_entry_t* entry;
+    upload_tracking_info_t snapshot;
+    unsigned long upload_id;
+    size_t filename_length;
+
+    if (!g_ready || request == NULL || body == NULL || body_length <= sizeof(prefix) - 1) return 0;
+    command = request_header_value(request, "X-Goog-Upload-Command");
+    if (!text_contains_ignore_case(command, "start") ||
+        memcmp(body, prefix, sizeof(prefix) - 1) != 0) return 0;
+
+    memset(&snapshot, 0, sizeof(snapshot));
+    EnterCriticalSection(&g_lock);
+    entry = allocate_entry_no_lock();
+    entry->in_use = 1;
+    entry->resumable = 1;
+    entry->created_tick = GetTickCount64();
+    entry->metadata_session_id = session_id;
+    entry->metadata_stream_id = stream_id;
+    entry->upload_id = g_next_upload_id++;
+    if (g_next_upload_id == 0) g_next_upload_id = 1;
+    entry->info.upload_id = entry->upload_id;
+    filename_length = body_length - (sizeof(prefix) - 1);
+    while (filename_length > 0 &&
+        (body[sizeof(prefix) - 1 + filename_length - 1] == '\r' ||
+         body[sizeof(prefix) - 1 + filename_length - 1] == '\n')) filename_length--;
+    if (filename_length >= sizeof(entry->info.filename)) filename_length = sizeof(entry->info.filename) - 1;
+    memcpy(entry->info.filename, body + sizeof(prefix) - 1, filename_length);
+    entry->info.filename[filename_length] = '\0';
+    sanitize_filename_in_place(entry->info.filename, sizeof(entry->info.filename));
+    declared_type = request_header_value(request, "X-Goog-Upload-Header-Content-Type");
+    if (declared_type != NULL) strncpy_s(entry->info.content_type,
+        sizeof(entry->info.content_type), declared_type, _TRUNCATE);
+    declared_size = request_header_value(request, "X-Goog-Upload-Header-Content-Length");
+    if (declared_size != NULL) entry->info.declared_size = _strtoui64(declared_size, NULL, 10);
+    strncpy_s(entry->info.upload_host, sizeof(entry->info.upload_host), request->host, _TRUNCATE);
+    upload_tracker_sanitize_path(request->path, entry->info.upload_path, sizeof(entry->info.upload_path));
+    upload_id = entry->upload_id;
+    snapshot = entry->info;
+    LeaveCriticalSection(&g_lock);
+
+    log_event(
+        "UPLOAD PREPARED id=%lu service=Gemini session=%lu file=\"%s\" declared_bytes=%llu type=%s start_target=%s%s correlation=session_host_path_fifo",
+        snapshot.upload_id, session_id, snapshot.filename[0] ? snapshot.filename : "unknown",
+        snapshot.declared_size, snapshot.content_type[0] ? snapshot.content_type : "unknown",
+        snapshot.upload_host, snapshot.upload_path);
+    return upload_id;
+}
+
+int upload_tracker_match_resumable_finalize(
+    unsigned long session_id,
+    const http_request_t* request,
+    unsigned long long content_length,
+    upload_tracking_info_t* info
+)
+{
+    const char* command;
+    int i;
+    upload_tracker_entry_t* best = NULL;
+    unsigned long long oldest_tick = ~0ULL;
+    unsigned long long now = GetTickCount64();
+    char clean_path[UPLOAD_TRACKER_PATH_SIZE];
+
+    if (info != NULL) memset(info, 0, sizeof(*info));
+    if (!g_ready || request == NULL) return 0;
+    command = request_header_value(request, "X-Goog-Upload-Command");
+    if (!text_contains_ignore_case(command, "finalize")) return 0;
+    upload_tracker_sanitize_path(request->path, clean_path, sizeof(clean_path));
+
+    EnterCriticalSection(&g_lock);
+    for (i = 0; i < UPLOAD_TRACKER_MAX_ENTRIES; i++) {
+        upload_tracker_entry_t* entry = &g_entries[i];
+        if (!entry->in_use || !entry->resumable || entry->matched ||
+            entry->metadata_session_id != session_id ||
+            now - entry->created_tick > UPLOAD_TRACKER_ENTRY_TTL_MS) continue;
+        if (_stricmp(entry->info.upload_host, request->host) != 0 ||
+            _stricmp(entry->info.upload_path, clean_path) != 0) continue;
+        if (entry->created_tick < oldest_tick) {
+            best = entry;
+            oldest_tick = entry->created_tick;
+        }
+    }
+    if (best != NULL) {
+        best->matched = 1;
+        strncpy_s(best->info.upload_host, sizeof(best->info.upload_host), request->host, _TRUNCATE);
+        strncpy_s(best->info.upload_path, sizeof(best->info.upload_path), clean_path, _TRUNCATE);
+        if (best->info.declared_size == 0) best->info.declared_size = content_length;
+        if (info != NULL) *info = best->info;
+    }
+    LeaveCriticalSection(&g_lock);
+    return best != NULL;
 }
 
 void upload_tracker_record_metadata_response(
@@ -333,7 +492,7 @@ void upload_tracker_record_metadata_response(
     LeaveCriticalSection(&g_lock);
 
     if (snapshot.upload_id != 0) {
-        log_info(
+        log_event(
             "UPLOAD PREPARED id=%lu file=\"%s\" declared_bytes=%llu type=%s target=%s%s",
             snapshot.upload_id,
             snapshot.filename[0] ? snapshot.filename : "unknown",
@@ -355,7 +514,7 @@ int upload_tracker_match_raw_put(
 {
     int i;
     upload_tracker_entry_t* best = NULL;
-    unsigned long long newest_tick = 0;
+    int fallback_candidates = 0;
     unsigned long long now = GetTickCount64();
     char clean_path[UPLOAD_TRACKER_PATH_SIZE];
 
@@ -368,18 +527,30 @@ int upload_tracker_match_raw_put(
         upload_tracker_entry_t* entry = &g_entries[i];
         int exact_target;
         int size_matches;
-        if (!entry->in_use || entry->matched || now - entry->created_tick > UPLOAD_TRACKER_ENTRY_TTL_MS) continue;
+        int type_matches;
+        if (!entry->in_use || entry->resumable ||
+            now - entry->created_tick > UPLOAD_TRACKER_ENTRY_TTL_MS) continue;
         exact_target = entry->info.upload_host[0] && entry->info.upload_path[0] &&
             _stricmp(entry->info.upload_host, host) == 0 && _stricmp(entry->info.upload_path, clean_path) == 0;
         size_matches = entry->info.declared_size == 0 || content_length == 0 ||
             entry->info.declared_size == content_length;
+        type_matches = entry->info.content_type[0] == '\0' || content_type == NULL ||
+            content_type[0] == '\0' || _stricmp(entry->info.content_type, content_type) == 0;
         if (exact_target) {
             best = entry;
             break;
         }
-        if (size_matches && entry->created_tick > newest_tick) {
-            best = entry;
-            newest_tick = entry->created_tick;
+        /*
+         * A browser can retry the same signed PUT after a local DLP block.
+         * Keep exact-target matches reusable for the entry TTL, but never use
+         * an already matched entry for the weaker size-only fallback.  This
+         * preserves the original filename on retries without correlating a
+         * later, unrelated upload merely because its size happens to match.
+        */
+        if (entry->matched) continue;
+        if (size_matches && type_matches) {
+            fallback_candidates++;
+            best = fallback_candidates == 1 ? entry : NULL;
         }
     }
 

@@ -21,9 +21,7 @@ echo.
 
 echo [3] Windows proxy settings
 echo ------------------------------------------------------------
-reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings" /v ProxyEnable
-reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings" /v ProxyServer
-reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings" /v ProxyOverride
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0windows_ai_proxy.ps1" -Action Status
 echo.
 
 echo [4] hosts entry for demo.local

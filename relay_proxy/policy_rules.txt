@@ -1,5 +1,5 @@
-# File-only DLP rules. Ordinary chat JSON, telemetry, response bodies, and
-# personal-information patterns are not inspected.
+# Upload-envelope and extracted-document DLP rules. KEYWORD and structured
+# pattern rules are applied to text extracted from documents and OCR images.
 # rule_id|action|type|pattern|reason
 1|BLOCK|FILE_EXT|.exe|Executable file upload blocked
 2|BLOCK|FILE_EXT|.dll|DLL file upload blocked
@@ -12,3 +12,14 @@
 9|BLOCK|FILE_EXT|.com|Executable command upload blocked
 10|LOG_ONLY|FILE_UPLOAD|-|File upload detected and allowed
 # Built-in multipart rule ID: 12=SIGNATURE_MISMATCH
+100|BLOCK|KEYWORD|대외비|Confidential Korean document marker detected
+101|BLOCK|KEYWORD|기밀|Confidential document marker detected
+102|BLOCK|KEYWORD|CONFIDENTIAL|Confidential English document marker detected
+103|BLOCK|KEYWORD|INTERNAL ONLY|Internal-only document marker detected
+110|BLOCK|RESIDENT_ID|-|Korean resident registration number detected
+111|BLOCK|CREDIT_CARD|-|Credit card number detected
+112|LOG_ONLY|EMAIL|-|Email address detected in uploaded document
+113|LOG_ONLY|PHONE|-|Korean mobile phone number detected in uploaded document
+120|BLOCK|KEYWORD|BEGIN PRIVATE KEY|Private key material detected
+121|BLOCK|KEYWORD|api_key=|API key assignment detected
+122|BLOCK|KEYWORD|access_token=|Access token assignment detected

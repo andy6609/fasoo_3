@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <direct.h>
+#include <io.h>
 #include <stdlib.h>
 #include <process.h>
 
@@ -43,6 +44,7 @@
 #define POLICY_FILE_PATH "policy_rules.txt"
 #define TLS_INTERCEPT_POLICY_FILE_PATH "tls_intercept_policy.txt"
 #define UPLOAD_CAPTURE_HOSTS_FILE_PATH "upload_capture_hosts.txt"
+#define AI_ONLY_PAC_FILE_PATH "ai_only_proxy.pac"
 
 #define BUFFER_SIZE 4096
 #define SELECT_TIMEOUT_SEC 300
@@ -51,6 +53,39 @@
 #define UPLOAD_HOST_DISCOVERY_MIN_BYTES_ENV "LOCAL_DLP_DISCOVERY_MIN_UPLOAD_BYTES"
 #define UPLOAD_HOST_DISCOVERY_DEFAULT_MIN_BYTES 4096ULL
 #define UPLOAD_HOST_DISCOVERY_WINDOW_MS 2000ULL
+#define AI_ONLY_PAC_MAX_BYTES (64 * 1024)
+#define PREVENTIVE_HTTP1_ENV "LOCAL_DLP_FORCE_HTTP1_UPLOAD_INSPECTION"
+#define CAPTURE_UPLOAD_BODIES_ENV "LOCAL_DLP_CAPTURE_UPLOAD_BODIES"
+#define BLOCK_UNSCANNABLE_ENV "LOCAL_DLP_BLOCK_UNSCANNABLE"
+
+static void resolve_runtime_config_path(
+    const char* filename,
+    char* resolved,
+    size_t resolved_size
+)
+{
+    static const char* prefixes[] = { "", "relay_proxy\\", "..\\..\\relay_proxy\\" };
+    size_t i;
+
+    if (resolved == NULL || resolved_size == 0) {
+        return;
+    }
+    resolved[0] = '\0';
+    if (filename == NULL || filename[0] == '\0') {
+        return;
+    }
+
+    for (i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); ++i) {
+        char candidate[MAX_PATH];
+        _snprintf_s(candidate, sizeof(candidate), _TRUNCATE, "%s%s", prefixes[i], filename);
+        if (_access(candidate, 0) == 0) {
+            strcpy_s(resolved, resolved_size, candidate);
+            return;
+        }
+    }
+
+    strcpy_s(resolved, resolved_size, filename);
+}
 
 static int environment_flag_enabled(const char* name)
 {
@@ -92,6 +127,14 @@ static unsigned long long upload_host_discovery_min_bytes(void)
 static int upload_host_discovery_enabled(void)
 {
     return environment_flag_enabled(UPLOAD_HOST_DISCOVERY_ENV);
+}
+
+static int socket_error_is_expected_disconnect(int error)
+{
+    return error == WSAECONNRESET ||
+        error == WSAECONNABORTED ||
+        error == WSAENOTCONN ||
+        error == WSAESHUTDOWN;
 }
 
 static int is_same_endpoint(
@@ -180,6 +223,180 @@ static int is_connect_request(const http_request_t* request)
     }
 
     return _stricmp(request->method, "CONNECT") == 0;
+}
+
+static int pac_path_matches(const char* path)
+{
+    static const char* local_absolute_prefixes[] = {
+        "http://127.0.0.1:8000/proxy.pac",
+        "http://localhost:8000/proxy.pac"
+    };
+    const char* suffix;
+    size_t i;
+
+    if (path == NULL || path[0] == '\0') {
+        return 0;
+    }
+
+    if (_strnicmp(path, "/proxy.pac", 10) == 0) {
+        suffix = path + 10;
+        return suffix[0] == '\0' || suffix[0] == '?' || suffix[0] == '#';
+    }
+
+    for (i = 0; i < sizeof(local_absolute_prefixes) / sizeof(local_absolute_prefixes[0]); ++i) {
+        size_t prefix_length = strlen(local_absolute_prefixes[i]);
+        if (_strnicmp(path, local_absolute_prefixes[i], prefix_length) == 0) {
+            suffix = path + prefix_length;
+            return suffix[0] == '\0' || suffix[0] == '?' || suffix[0] == '#';
+        }
+    }
+
+    return 0;
+}
+
+static int pac_host_is_local(const char* host)
+{
+    if (host == NULL || host[0] == '\0') {
+        return 0;
+    }
+
+    return _stricmp(host, "127.0.0.1") == 0 ||
+           _stricmp(host, "127.0.0.1:8000") == 0 ||
+           _stricmp(host, "localhost") == 0 ||
+           _stricmp(host, "localhost:8000") == 0;
+}
+
+static int is_ai_only_pac_request(const http_request_t* request)
+{
+    if (request == NULL) {
+        return 0;
+    }
+
+    return _stricmp(request->method, "GET") == 0 &&
+           pac_host_is_local(request->host) &&
+           pac_path_matches(request->path);
+}
+
+static int send_simple_http_error(SOCKET client_sock, int status_code, const char* reason)
+{
+    char response[512];
+    int response_length;
+    const char* safe_reason = reason != NULL ? reason : "Service Unavailable";
+
+    response_length = _snprintf_s(
+        response,
+        sizeof(response),
+        _TRUNCATE,
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Type: text/plain; charset=utf-8\r\n"
+        "Content-Length: 0\r\n"
+        "Cache-Control: no-store\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        status_code,
+        safe_reason
+    );
+
+    if (response_length <= 0) {
+        return -1;
+    }
+
+    return send_all(client_sock, response, response_length) == response_length ? 0 : -1;
+}
+
+static int serve_ai_only_pac(SOCKET client_sock, unsigned long session_id)
+{
+    char pac_path[MAX_PATH];
+    char response_header[512];
+    FILE* pac_file = NULL;
+    char* pac_body = NULL;
+    long pac_length;
+    size_t read_length;
+    int header_length;
+    int result = -1;
+
+    resolve_runtime_config_path(AI_ONLY_PAC_FILE_PATH, pac_path, sizeof(pac_path));
+
+    pac_file = fopen(pac_path, "rb");
+    if (pac_file == NULL) {
+        log_error("AI-only PAC file could not be opened. session_id=%lu path=%s", session_id, pac_path);
+        send_simple_http_error(client_sock, 503, "Service Unavailable");
+        return -1;
+    }
+
+    if (fseek(pac_file, 0, SEEK_END) != 0) {
+        log_error("AI-only PAC file size could not be read. session_id=%lu path=%s", session_id, pac_path);
+        goto cleanup;
+    }
+
+    pac_length = ftell(pac_file);
+    if (pac_length <= 0 || pac_length > AI_ONLY_PAC_MAX_BYTES) {
+        log_error(
+            "AI-only PAC file has an invalid size. session_id=%lu path=%s bytes=%ld limit=%d",
+            session_id,
+            pac_path,
+            pac_length,
+            AI_ONLY_PAC_MAX_BYTES
+        );
+        goto cleanup;
+    }
+
+    if (fseek(pac_file, 0, SEEK_SET) != 0) {
+        goto cleanup;
+    }
+
+    pac_body = (char*)malloc((size_t)pac_length);
+    if (pac_body == NULL) {
+        log_error("AI-only PAC response allocation failed. session_id=%lu bytes=%ld", session_id, pac_length);
+        goto cleanup;
+    }
+
+    read_length = fread(pac_body, 1, (size_t)pac_length, pac_file);
+    if (read_length != (size_t)pac_length) {
+        log_error(
+            "AI-only PAC file read was incomplete. session_id=%lu expected=%ld actual=%zu",
+            session_id,
+            pac_length,
+            read_length
+        );
+        goto cleanup;
+    }
+
+    header_length = _snprintf_s(
+        response_header,
+        sizeof(response_header),
+        _TRUNCATE,
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: application/x-ns-proxy-autoconfig\r\n"
+        "Content-Length: %ld\r\n"
+        "Cache-Control: no-store, no-cache, must-revalidate\r\n"
+        "Pragma: no-cache\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        pac_length
+    );
+
+    if (header_length <= 0 ||
+        send_all(client_sock, response_header, header_length) != header_length ||
+        send_all(client_sock, pac_body, (int)pac_length) != (int)pac_length) {
+        log_error("AI-only PAC response send failed. session_id=%lu error=%d", session_id, WSAGetLastError());
+        goto cleanup;
+    }
+
+    log_debug("AI-only PAC response served. session_id=%lu bytes=%ld", session_id, pac_length);
+    result = 0;
+
+cleanup:
+    if (result != 0) {
+        send_simple_http_error(client_sock, 503, "Service Unavailable");
+    }
+    if (pac_body != NULL) {
+        free(pac_body);
+    }
+    if (pac_file != NULL) {
+        fclose(pac_file);
+    }
+    return result;
 }
 
 static int is_web_browser_process(const process_metadata_t* metadata)
@@ -363,21 +580,38 @@ static void log_upload_host_discovery_summary(
         signal = "inbound_dominant_or_balanced";
     }
 
-    log_info(
-        "UPLOAD_HOST_DISCOVERY_SUMMARY session_id=%lu process=%s target=%s:%d candidate=%s signal=%s outbound_bytes=%llu inbound_bytes=%llu min_upload_bytes=%llu duration_ms=%llu result=%s finish_reason=%s mode=encrypted_metadata_only payload_decrypted=false",
-        session->session_id,
-        session->process.process_name[0] != '\0' ? session->process.process_name : "-",
-        safe_log_string(target_host),
-        target_port,
-        candidate ? "YES" : "NO",
-        signal,
-        bytes_client_to_upstream,
-        bytes_upstream_to_client,
-        min_upload_bytes,
-        duration_ms,
-        result == 0 ? "OK" : "ERROR",
-        safe_log_string(finish_reason)
-    );
+    if (candidate) {
+        log_info(
+            "UPLOAD_HOST_DISCOVERY_SUMMARY session_id=%lu process=%s target=%s:%d candidate=YES signal=%s outbound_bytes=%llu inbound_bytes=%llu min_upload_bytes=%llu duration_ms=%llu result=%s finish_reason=%s mode=encrypted_metadata_only payload_decrypted=false",
+            session->session_id,
+            session->process.process_name[0] != '\0' ? session->process.process_name : "-",
+            safe_log_string(target_host),
+            target_port,
+            signal,
+            bytes_client_to_upstream,
+            bytes_upstream_to_client,
+            min_upload_bytes,
+            duration_ms,
+            result == 0 ? "OK" : "ERROR",
+            safe_log_string(finish_reason)
+        );
+    }
+    else {
+        log_debug(
+            "UPLOAD_HOST_DISCOVERY_SUMMARY session_id=%lu process=%s target=%s:%d candidate=NO signal=%s outbound_bytes=%llu inbound_bytes=%llu min_upload_bytes=%llu duration_ms=%llu result=%s finish_reason=%s mode=encrypted_metadata_only payload_decrypted=false",
+            session->session_id,
+            session->process.process_name[0] != '\0' ? session->process.process_name : "-",
+            safe_log_string(target_host),
+            target_port,
+            signal,
+            bytes_client_to_upstream,
+            bytes_upstream_to_client,
+            min_upload_bytes,
+            duration_ms,
+            result == 0 ? "OK" : "ERROR",
+            safe_log_string(finish_reason)
+        );
+    }
 }
 
 static void log_raw_tunnel_summary(
@@ -481,7 +715,7 @@ static int raw_tunnel_loop(
 
     if (upload_discovery_active) {
         discovery_min_upload_bytes = upload_host_discovery_min_bytes();
-        log_info(
+        log_debug(
             "UPLOAD_HOST_DISCOVERY_BEGIN session_id=%lu process=%s target=%s:%d min_upload_bytes=%llu window_ms=%llu mode=encrypted_metadata_only payload_decrypted=false",
             session->session_id,
             session->process.process_name[0] != '\0' ? session->process.process_name : "-",
@@ -597,13 +831,25 @@ static int raw_tunnel_loop(
                 break;
             }
             else {
-                log_error(
-                    "CONNECT tunnel recv() from client failed. session_id=%lu error=%d",
-                    session->session_id,
-                    WSAGetLastError()
-                );
-                finish_reason = "recv_from_client_error";
-                result = -1;
+                int error = WSAGetLastError();
+                if (socket_error_is_expected_disconnect(error)) {
+                    log_debug(
+                        "CONNECT tunnel client closed socket. session_id=%lu error=%d",
+                        session->session_id,
+                        error
+                    );
+                    finish_reason = "client_disconnected";
+                    result = 0;
+                }
+                else {
+                    log_error(
+                        "CONNECT tunnel recv() from client failed. session_id=%lu error=%d",
+                        session->session_id,
+                        error
+                    );
+                    finish_reason = "recv_from_client_error";
+                    result = -1;
+                }
                 break;
             }
         }
@@ -661,13 +907,25 @@ static int raw_tunnel_loop(
                 break;
             }
             else {
-                log_error(
-                    "CONNECT tunnel recv() from upstream failed. session_id=%lu error=%d",
-                    session->session_id,
-                    WSAGetLastError()
-                );
-                finish_reason = "recv_from_upstream_error";
-                result = -1;
+                int error = WSAGetLastError();
+                if (socket_error_is_expected_disconnect(error)) {
+                    log_debug(
+                        "CONNECT tunnel upstream closed socket. session_id=%lu error=%d",
+                        session->session_id,
+                        error
+                    );
+                    finish_reason = "upstream_disconnected";
+                    result = 0;
+                }
+                else {
+                    log_error(
+                        "CONNECT tunnel recv() from upstream failed. session_id=%lu error=%d",
+                        session->session_id,
+                        error
+                    );
+                    finish_reason = "recv_from_upstream_error";
+                    result = -1;
+                }
                 break;
             }
         }
@@ -1279,11 +1537,19 @@ int relay_loop(proxy_session_context_t* session)
                             goto cleanup;
                         }
 
+                        if (is_ai_only_pac_request(&request)) {
+                            loop_result = serve_ai_only_pac(client_sock, session->session_id);
+                            goto cleanup;
+                        }
+
                         if (!should_suppress_connect_policy_logs(session, &request)) {
-                            if (logger_is_debug_enabled()) {
+                            if (logger_is_debug_enabled() &&
+                                (is_connect_request(&request) || dlp_request_is_file_upload(&request))) {
                                 print_http_request(&request);
                             }
-                            log_http_request_analysis(&request, session->session_id, "HTTP");
+                            if (is_connect_request(&request) || dlp_request_is_file_upload(&request)) {
+                                log_http_request_analysis(&request, session->session_id, "HTTP");
+                            }
                         }
 
                         if (is_connect_request(&request)) {
@@ -1760,6 +2026,7 @@ cleanup:
     close_socket_safe(&upstream_sock);
 
     if (request_buffer != NULL) {
+        request_buffer_cleanup(request_buffer);
         free(request_buffer);
         request_buffer = NULL;
     }
@@ -1936,7 +2203,13 @@ static SOCKET create_exclusive_listener(int port)
     return listen_sock;
 }
 
-static int run_file_analyzer_cli(const char* file_path, const char* content_type)
+static int run_file_analyzer_cli(
+    const char* file_path,
+    const char* content_type,
+    int print_text,
+    const char* store_service,
+    int enforce_content_policy
+)
 {
     FILE* file = NULL;
     long file_size;
@@ -1946,6 +2219,9 @@ static int run_file_analyzer_cli(const char* file_path, const char* content_type
     const char* slash;
     const char* backslash;
     file_analysis_result_t result;
+    char* extracted_text = NULL;
+    size_t extracted_text_length = 0;
+    int extracted_text_truncated = 0;
     int exit_code = 1;
 
     if (file_path == NULL || file_path[0] == '\0') return 1;
@@ -1973,6 +2249,17 @@ static int run_file_analyzer_cli(const char* file_path, const char* content_type
         fprintf(stderr, "file analyzer: inspection failed\n");
         goto cleanup;
     }
+    if (enforce_content_policy && result.action != FILE_ANALYSIS_BLOCK) {
+        dlp_result_t content_result = inspect_dlp_file_content(
+            filename, content_type, data, bytes_read, &result);
+        if (content_result.action == DLP_ACTION_BLOCK) {
+            result.action = FILE_ANALYSIS_BLOCK;
+            _snprintf_s(result.reason, sizeof(result.reason), _TRUNCATE,
+                "content policy rule %d: %s",
+                content_result.matched_rule_id,
+                content_result.reason[0] ? content_result.reason : "blocked");
+        }
+    }
     printf(
         "FILE ANALYSIS file=\"%s\" bytes=%llu type=%s format=%s entries=%u "
         "extracted_text_bytes=%llu sha256=%s action=%s reason=\"%s\"\n",
@@ -1986,9 +2273,66 @@ static int run_file_analyzer_cli(const char* file_path, const char* content_type
         result.action == FILE_ANALYSIS_BLOCK ? "BLOCK" : "ALLOW",
         result.reason
     );
+    if (print_text && file_analyzer_extract_text(
+        filename,
+        content_type,
+        data,
+        bytes_read,
+        &extracted_text,
+        &extracted_text_length,
+        &extracted_text_truncated
+    ) == 0) {
+        printf("----- EXTRACTED CONTENT BEGIN bytes=%llu truncated=%s -----\n",
+            (unsigned long long)extracted_text_length,
+            extracted_text_truncated ? "true" : "false");
+        if (extracted_text_length > 0) fwrite(extracted_text, 1, extracted_text_length, stdout);
+        printf("\n----- EXTRACTED CONTENT END -----\n");
+    }
+    if (store_service != NULL && store_service[0] != '\0') {
+        proxy_session_context_t test_session;
+        http_request_t test_request;
+        memset(&test_session, 0, sizeof(test_session));
+        memset(&test_request, 0, sizeof(test_request));
+        test_session.session_id = 999999;
+        strcpy_s(test_session.client_ip, sizeof(test_session.client_ip), "127.0.0.1");
+        test_session.process.found = 1;
+        test_session.process.process_id = GetCurrentProcessId();
+        strcpy_s(test_session.process.process_name,
+            sizeof(test_session.process.process_name), "relay_proxy.exe");
+        strcpy_s(test_session.process.process_path,
+            sizeof(test_session.process.process_path), "local-store-test");
+        strcpy_s(test_request.method, sizeof(test_request.method), "PUT");
+        strcpy_s(test_request.path, sizeof(test_request.path), "/local-store-test");
+        strcpy_s(test_request.host, sizeof(test_request.host),
+            _stricmp(store_service, "Claude") == 0 ? "claude.ai" :
+            (_stricmp(store_service, "Gemini") == 0 ? "gemini.google.com" : "chatgpt.com"));
+        strncpy_s(test_request.content_type, sizeof(test_request.content_type),
+            content_type != NULL ? content_type : "application/octet-stream", _TRUNCATE);
+        test_request.content_length = (int)bytes_read;
+        if (upload_record_store_file(
+            &test_session,
+            &test_request,
+            store_service,
+            "local-test",
+            1,
+            filename,
+            data,
+            bytes_read,
+            &result
+        ) <= 0) {
+            fprintf(stderr, "upload record store: disabled or failed\n");
+            goto cleanup;
+        }
+    }
     exit_code = result.action == FILE_ANALYSIS_BLOCK ? 2 : 0;
 
 cleanup:
+    /* Flush CLI evidence before Windows Runtime OCR objects are released at
+     * process shutdown.  Without this, redirected/piped PDF inspection output
+     * can remain in the CRT buffer even though the intended exit code is set. */
+    fflush(stdout);
+    fflush(stderr);
+    free(extracted_text);
     free(data);
     if (file != NULL) fclose(file);
     return exit_code;
@@ -2001,9 +2345,39 @@ int main(int argc, char** argv)
     SOCKET listen_sock = INVALID_SOCKET;
 
     char cwd[512];
+    char policy_path[MAX_PATH];
+    char tls_policy_path[MAX_PATH];
+    char upload_capture_hosts_path[MAX_PATH];
+    int preventive_capture_mode;
+    int policy_init_result;
+    int tls_policy_load_result;
+    int upload_capture_init_result;
 
     if (argc >= 3 && _stricmp(argv[1], "--analyze-file") == 0) {
-        return run_file_analyzer_cli(argv[2], argc >= 4 ? argv[3] : "application/octet-stream");
+        return run_file_analyzer_cli(argv[2], argc >= 4 ? argv[3] : "application/octet-stream", 0, NULL, 0);
+    }
+    if (argc >= 3 && _stricmp(argv[1], "--extract-file") == 0) {
+        return run_file_analyzer_cli(argv[2], argc >= 4 ? argv[3] : "application/octet-stream", 1, NULL, 0);
+    }
+    if (argc >= 3 && _stricmp(argv[1], "--inspect-file") == 0) {
+        int cli_result;
+        resolve_runtime_config_path(POLICY_FILE_PATH, policy_path, sizeof(policy_path));
+        policy_engine_init(policy_path);
+        cli_result = run_file_analyzer_cli(
+            argv[2], argc >= 4 ? argv[3] : "application/octet-stream", 1, NULL, 1);
+        policy_engine_cleanup();
+        return cli_result;
+    }
+    if (argc >= 3 && _stricmp(argv[1], "--store-file") == 0) {
+        int cli_result;
+        resolve_runtime_config_path(POLICY_FILE_PATH, policy_path, sizeof(policy_path));
+        policy_engine_init(policy_path);
+        _putenv_s("LOCAL_DLP_SAVE_UPLOAD_RECORDS", "1");
+        cli_result = run_file_analyzer_cli(
+            argv[2], argc >= 4 ? argv[3] : "application/octet-stream",
+            1, argc >= 5 ? argv[4] : "ChatGPT", 1);
+        policy_engine_cleanup();
+        return cli_result;
     }
 
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
@@ -2022,24 +2396,61 @@ int main(int argc, char** argv)
         printf("[WARN] logger_init failed. continue without file logging.\n");
     }
 
+    resolve_runtime_config_path(POLICY_FILE_PATH, policy_path, sizeof(policy_path));
+    resolve_runtime_config_path(
+        TLS_INTERCEPT_POLICY_FILE_PATH,
+        tls_policy_path,
+        sizeof(tls_policy_path)
+    );
+    resolve_runtime_config_path(
+        UPLOAD_CAPTURE_HOSTS_FILE_PATH,
+        upload_capture_hosts_path,
+        sizeof(upload_capture_hosts_path)
+    );
+
+    preventive_capture_mode = environment_flag_enabled(PREVENTIVE_HTTP1_ENV) ||
+        (environment_flag_enabled(CAPTURE_UPLOAD_BODIES_ENV) &&
+            environment_flag_enabled(BLOCK_UNSCANNABLE_ENV));
+
     if (upload_tracker_init() != 0) {
         log_warn("upload_tracker_init() failed. original file-name correlation is disabled.");
     }
 
-    if (policy_engine_init(POLICY_FILE_PATH) != 0) {
+    policy_init_result = policy_engine_init(policy_path);
+    if (policy_init_result != 0) {
         log_warn("policy_engine_init() failed. continue with available policy rules.");
     }
 
 #if ENABLE_TLS_MITM
-    if (tls_intercept_policy_load(TLS_INTERCEPT_POLICY_FILE_PATH) != 0) {
+    tls_policy_load_result = tls_intercept_policy_load(tls_policy_path);
+    if (tls_policy_load_result != 0) {
         log_warn("tls_intercept_policy_load() failed. continue with safe default TLS intercept policy.");
     }
-    if (upload_capture_init(UPLOAD_CAPTURE_HOSTS_FILE_PATH) != 0) {
+    upload_capture_init_result = upload_capture_init(upload_capture_hosts_path);
+    if (upload_capture_init_result != 0) {
         log_warn("upload_capture_init() failed. continue without confirmed-host body capture.");
+    }
+
+    if (preventive_capture_mode &&
+        (policy_init_result != 0 || tls_policy_load_result != 0 ||
+            upload_capture_init_result != 0 ||
+            !upload_capture_is_enabled())) {
+        log_error(
+            "Preventive upload DLP startup failed closed. content_policy_ready=%s tls_policy_ready=%s upload_capture_ready=%s",
+            policy_init_result == 0 ? "true" : "false",
+            tls_policy_load_result == 0 ? "true" : "false",
+            upload_capture_init_result == 0 && upload_capture_is_enabled() ? "true" : "false");
+        tls_intercept_policy_cleanup();
+        upload_capture_cleanup();
+        upload_tracker_cleanup();
+        policy_engine_cleanup();
+        logger_close();
+        WSACleanup();
+        return 1;
     }
 #endif
 
-    if (command_thread_start(POLICY_FILE_PATH) != 0) {
+    if (command_thread_start(policy_path) != 0) {
         log_warn("command_thread_start() failed. policy reload command is disabled.");
     }
 
@@ -2063,7 +2474,7 @@ int main(int argc, char** argv)
     log_info("Dynamic upstream mode enabled. Upstream is resolved from HTTP Host header.");
     #if ENABLE_TLS_MITM
     log_info("CONNECT TLS MITM mode enabled with TLS intercept policy. Policy actions: MITM, BYPASS, BLOCK, AUDIT, IGNORE.");
-    log_info("CONNECT TLS intercept policy file: %s", TLS_INTERCEPT_POLICY_FILE_PATH);
+    log_info("CONNECT TLS intercept policy file: %s", tls_policy_path);
     log_info("HTTPS DLP protocol mode: ALPN auto-select with HTTP/1.1 and HTTP/2 enforcement.");
     if (upload_host_discovery_enabled()) {
         log_info(

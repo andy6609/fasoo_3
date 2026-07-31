@@ -3,6 +3,7 @@
 
 #include "http_parser.h"
 #include "http_response_parser.h"
+#include "file_analyzer.h"
 
 typedef enum {
     DLP_ACTION_ALLOW = 0,
@@ -21,5 +22,16 @@ dlp_result_t inspect_dlp_request(const http_request_t* request);
 dlp_result_t inspect_dlp_response(const http_response_t* response);
 int dlp_request_is_file_upload(const http_request_t* request);
 int dlp_request_should_inspect(const http_request_t* request);
+
+/* Apply content rules to human-readable text extracted from a file. When
+ * LOCAL_DLP_BLOCK_UNSCANNABLE=1, extraction failures and explicitly
+ * incomplete formats fail closed. */
+dlp_result_t inspect_dlp_file_content(
+    const char* filename,
+    const char* content_type,
+    const unsigned char* data,
+    size_t length,
+    const file_analysis_result_t* analysis
+);
 
 #endif

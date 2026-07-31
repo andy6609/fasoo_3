@@ -1,16 +1,38 @@
 @echo off
 setlocal
 
+cd /d "%~dp0"
+
 echo [INFO] generating relay_proxy MITM CA certificate...
 
-set OPENSSL_EXE=C:\vcpkg\downloads\tools\perl\5.42.2.1\c\bin\openssl.exe
+if exist "certs\mitm.crt" if exist "certs\mitm.key" (
+    echo [INFO] Existing matching CA certificate and private key will be reused.
+    echo        certs\mitm.crt
+    echo        certs\mitm.key
+    exit /b 0
+)
+
+if exist "certs\mitm.crt" if not exist "certs\mitm.key" (
+    echo [ERROR] certs\mitm.crt exists but certs\mitm.key is missing.
+    echo         Do not silently replace one half of a CA pair.
+    exit /b 1
+)
+if exist "certs\mitm.key" if not exist "certs\mitm.crt" (
+    echo [ERROR] certs\mitm.key exists but certs\mitm.crt is missing.
+    echo         Do not silently replace one half of a CA pair.
+    exit /b 1
+)
+
+set "OPENSSL_EXE=C:\vcpkg\downloads\tools\perl\5.42.2.1\c\bin\openssl.exe"
+if not exist "%OPENSSL_EXE%" (
+    for /f "delims=" %%I in ('where openssl.exe 2^>nul') do set "OPENSSL_EXE=%%I"
+)
 
 if not exist "%OPENSSL_EXE%" (
     echo [ERROR] openssl.exe not found:
     echo %OPENSSL_EXE%
     echo.
     echo Edit OPENSSL_EXE in this bat file or install OpenSSL.
-    pause
     exit /b 1
 )
 
@@ -49,7 +71,6 @@ set OPENSSL_CONF=%CD%\certs\openssl_ca.cnf
 
 if errorlevel 1 (
     echo [ERROR] failed to create MITM CA certificate
-    pause
     exit /b 1
 )
 
@@ -63,5 +84,4 @@ echo   certs\generated\
 echo.
 
 dir certs
-pause
 endlocal

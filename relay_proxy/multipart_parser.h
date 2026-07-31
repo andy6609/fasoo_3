@@ -3,15 +3,18 @@
 
 #include "http_parser.h"
 #include "dlp_engine.h"
+#include "session_context.h"
 
 /*
  * Inspect multipart/form-data request bodies for browser file uploads.
  *
- * Large-upload behavior:
- *   - File size over LOCAL_DLP_MAX_UPLOAD_BYTES, default 10MB, is blocked.
- *   - File content keyword/email scan uses a bounded streaming-style sample,
- *     LOCAL_DLP_MAX_MULTIPART_SCAN_BYTES, default 1MB.
- *   - Existing extension rules are still applied before content scanning.
+ * Parsing and record behavior:
+ *   - MIME delimiters are accepted only at body start or after CRLF.
+ *   - filename*=UTF-8''... parameters are RFC 5987 percent-decoded.
+ *   - Every file part is analyzed and recorded even after an earlier part
+ *     blocks the enclosing request.
+ *   - When LOCAL_DLP_SAVE_UPLOAD_RECORDS is enabled, a reported record-write
+ *     failure changes an otherwise allowed request to fail-closed BLOCK.
  *
  * The function treats result as an in/out value:
  *   - If result is already BLOCK, it is left unchanged.
@@ -23,5 +26,14 @@
  *   0 = request was not multipart/form-data or no body was available
  */
 int inspect_multipart_upload_request(const http_request_t* request, dlp_result_t* result);
+
+int inspect_multipart_upload_request_with_context(
+    const http_request_t* request,
+    dlp_result_t* result,
+    const proxy_session_context_t* session,
+    const char* service,
+    const char* protocol,
+    unsigned int stream_id
+);
 
 #endif

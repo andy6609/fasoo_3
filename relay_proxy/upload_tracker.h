@@ -2,6 +2,7 @@
 #define UPLOAD_TRACKER_H
 
 #include <stddef.h>
+#include "http_parser.h"
 
 #define UPLOAD_TRACKER_FILENAME_SIZE 512
 #define UPLOAD_TRACKER_CONTENT_TYPE_SIZE 256
@@ -31,6 +32,21 @@ unsigned long upload_tracker_record_metadata_request(
     unsigned int stream_id,
     const char* body,
     size_t body_length
+);
+
+unsigned long upload_tracker_record_resumable_start(
+    unsigned long session_id,
+    unsigned int stream_id,
+    const http_request_t* request,
+    const char* body,
+    size_t body_length
+);
+
+int upload_tracker_match_resumable_finalize(
+    unsigned long session_id,
+    const http_request_t* request,
+    unsigned long long content_length,
+    upload_tracking_info_t* info
 );
 
 void upload_tracker_record_metadata_response(
