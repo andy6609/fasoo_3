@@ -1,0 +1,6 @@
+filename	size	djb2_hash	magic(hex)	confirmed_by
+A_기밀_설계문서.pdf	2084	e1625535be12246f	25 50 44 46 2d 31 2e 34	claude.ai/Gemini/ChatGPT 3사 실측 일치 (Infinity_v2, 2026-07-28)
+B_2026_급여명세서.pdf	22686	26592ed4f8e2595a	89 50 4e 47 0d 0a 1a 0a	claude.ai/Gemini/ChatGPT 3사 실측 일치 (Infinity_v2, 2026-07-28)
+C_대용량_고객리스트.pdf	618742	db0e09c8f3f19f48	25 50 44 46 2d 31 2e 34	예측치, 미확인 — 3사 전부 256KB 캡처 상한에 걸려 절단되어 전체 해시가 계산된 적 없음
+D_인사평가_초안.docx	1487	835008b7d5d607a8	50 4b 03 04 14 00 00 00	claude.ai 실측 (Infinity_v2, 2026-07-28)
+E_고객데이터_원본.xlsx	22772	ffe3148eace6c295	89 50 4e 47 0d 0a 1a 0a	claude.ai 실측 (Infinity_v2, 2026-07-28)

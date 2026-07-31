@@ -1,0 +1,11 @@
+# 빌드 산출물
+build/
+captured_files/
+*.exe
+*.dll
+*.pdb
+*.obj
+
+# rootCA (비밀키 유출 방지)
+rootCA.key
+rootCA.crt
